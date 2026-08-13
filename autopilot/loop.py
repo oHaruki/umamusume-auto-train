@@ -37,7 +37,7 @@ from autopilot.screens import (
   BORROW_RELOAD_BUTTON, BORROW_SCROLL_TO, DUPLICATE_BADGE, EDIT_AGENDA_BUTTON,
   FRIENDS_SLOT_EMPTY, LOAD_LIST_BUTTON,
   MATCH_THRESHOLD, MY_AGENDAS_BUTTON, NORMAL_MODE_LABEL, SCREENS,
-  SKILL_POINTS_LTRB, SKILLS_BUTTON, START_BUTTON, START_CAREER_BUTTON,
+  SKILL_POINTS_LTRB, TP_LTRB, TP_TIME_LTRB, SKILLS_BUTTON, START_BUTTON, START_CAREER_BUTTON,TP_EVENT_BUTTON, NEXT_BUTTON,
 )
 
 CLOSE_BUTTON = "assets/buttons/close_btn.png"
@@ -111,6 +111,24 @@ class Autopilot:
     pil = pil.resize((pil.width * 3, pil.height * 3), Image.BICUBIC)
     return extract_number(pil)
 
+  def read_current_tp(self):
+    """ check current tp"""
+    crop = device_action.screenshot(region_ltrb=TP_LTRB)
+    pil = Image.fromarray(crop)
+    pil = pil.resize((pil.width * 3, pil.height * 3), Image.BICUBIC)
+    return extract_number(pil)
+  
+  def read_tp_refresh_time(self):
+    """get remaining tp time in seconds"""
+    crop = device_action.screenshot(region_ltrb=TP_TIME_LTRB)
+    pil = Image.fromarray(crop)
+    pil = pil.resize((pil.width * 3, pil.height * 3), Image.BICUBIC)
+    rawtime = extract_number(pil)
+    # raw time is what is directly read, eg 1000 -> 10 min
+    minutes = rawtime // 100
+    seconds = rawtime % 100
+    return minutes * 60 + seconds
+  
   def duplicate_badge_ys(self) -> list[int]:
     """Y positions of every "Duplicate Support" badge currently on screen."""
     frame = device_action.screenshot()
@@ -146,6 +164,27 @@ class Autopilot:
     return parse_rows(result, y_offset=BORROW_LIST_LTRB[1], x_offset=BORROW_LIST_LTRB[0])
 
   # --- handlers -------------------------------------------------------
+  def do_scenario_select(self,screen):
+    tp_cost = 30
+    if device_action.locate(TP_EVENT_BUTTON,confidence=MATCH_THRESHOLD):
+      info("TP Event Active")
+      tp_cost = 15
+    current_tp = self.read_current_tp()
+    info(f"Current TP is {current_tp} and cost is {tp_cost}")
+    #continue if enough tp, otherwise wait or quit depending on config
+    if(current_tp>=tp_cost):
+      info("Enough TP, selecting scenario.")
+      device_action.locate_and_click(NEXT_BUTTON, confidence=MATCH_THRESHOLD)
+    else:
+      info("Not enough TP")
+      if self.cfg.wait_when_out_of_tp:
+        sleeptime = (tp_cost-current_tp-1)*10*60 + self.read_tp_refresh_time()
+        info(f"Waiting for {sleeptime} seconds ")
+        sleep(sleeptime)
+      else:
+        info("Wait for TP set to false, exiting")
+        bot.is_bot_running = False
+  
   def do_formation(self, screen):
     """Borrow first if the slot is still empty, otherwise start the career."""
     if device_action.locate(FRIENDS_SLOT_EMPTY, confidence=MATCH_THRESHOLD):

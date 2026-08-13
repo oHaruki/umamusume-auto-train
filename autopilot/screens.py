@@ -52,7 +52,7 @@ SCREENS: tuple[Screen, ...] = (
   # way. The header is unaffected, so identification never needed changing.
   Screen("scenario_select", f"{AUTO}/scenario_select_header.png",
          "keep the shown scenario and continue",
-         click=f"{AUTO}/next_btn_below_ribbon.png"),
+         handler="scenario_select"),
   # While an event is running, Next opens this instead of going straight on to
   # Trainee Select. The generic "confirmation" rule at the bottom would already
   # clear it - Normal Mode is highlighted when the popup opens, so pressing
@@ -145,6 +145,9 @@ MY_AGENDAS_BUTTON = f"{AUTO}/my_agendas_btn.png"
 # Repeats once per saved agenda; locate() returns the topmost, i.e. the first.
 LOAD_LIST_BUTTON = f"{AUTO}/load_list_btn.png"
 
+TP_EVENT_BUTTON = f"{AUTO}/tp_event.png"
+NEXT_BUTTON = f"{AUTO}/next_btn_below_ribbon.png"
+
 MATCH_THRESHOLD = 0.85
 
 # --- geometry, in ADB frame coordinates (800x1080) --------------------
@@ -169,6 +172,10 @@ DUPLICATE_BADGE = f"{AUTO}/duplicate_support_badge.png"
 # Skill point total on the Learn screen, right of the "Skill Points" bar.
 # Verified reading 3258 off a real frame.
 SKILL_POINTS_LTRB = (560, 342, 680, 375)
+
+# current TP 
+TP_LTRB = (325,31,359,47)
+TP_TIME_LTRB = (270,37,305,48)
 
 # easyocr allowlist for the Borrow Card rows. The repo default omits brackets,
 # which measurably degrades card titles ([Teio-Oo-Oolll] 0.80 -> 1.00).
