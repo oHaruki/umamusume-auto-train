@@ -42,3 +42,6 @@ assets/notifications/*
 !assets/notifications/sfx_01.mp3
 !assets/notifications/sfx_02.mp3
 !assets/notifications/sfx_03.mp3
+
+# GameTora data-layer cache (devtools/scrape_supports.py)
+devtools/.gtcache/

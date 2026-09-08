@@ -479,12 +479,29 @@ class BaseScraper:
     def _sort_by_value(self, driver: uc.Chrome, value_key: str):
         """Sorts the list elements by the given value key.
 
+        Picks the <select> that actually offers the option rather than the
+        first one whose id looks React-generated. That old rule broke twice
+        over: these pages now carry a dozen selects, so "the first" is a filter
+        control and not the sort; and React emits ids like ":R6ifhl6:" with a
+        capital R when a select is server-rendered, which contains(@id, ':r')
+        cannot match because XPath is case-sensitive. The characters page hit
+        both and died on this line.
+
+        Sorting is a convenience - the delta skip works off ids, not order - so
+        a page that no longer offers this option is a warning, not a failure.
+
         Args:
             driver (uc.Chrome): The Chrome driver.
             value_key (str): The key to sort by.
         """
-        # Click on the "Sort by" dropdown and select the value key.
-        sort_by_dropdown = driver.find_element(By.XPATH, "//select[contains(@id, ':r')]")
+        try:
+            sort_by_dropdown = driver.find_element(
+                By.XPATH, f"//select[option[@value='{value_key}']]")
+        except NoSuchElementException:
+            logging.warning(
+                f"No sort dropdown offering '{value_key}' on {self.url}; "
+                "scraping in the page's own order instead.")
+            return
         sort_by_dropdown.click()
         time.sleep(0.5)
         value_option = sort_by_dropdown.find_element(By.XPATH, f".//option[@value='{value_key}']")
@@ -524,8 +541,11 @@ class CharacterScraper(BaseScraper):
             logging.info(f"buildId not found")
 
         # Get all character links.
-        character_grid = driver.find_element(By.XPATH, "//div[contains(@class, 'sc-dc9ce0a6-0')]")
-        all_character_items = character_grid.find_elements(By.CSS_SELECTOR, "a.sc-df8b554e-1")
+        # Selected by where the links point, not by the generated class names
+        # they happen to carry this week: the old pair (sc-dc9ce0a6-0 wrapping
+        # a.sc-df8b554e-1) no longer exists on the page at all.
+        all_character_items = driver.find_elements(
+            By.CSS_SELECTOR, 'a[href*="/umamusume/characters/"]')
         # Filter out hidden elements using Selenium's is_displayed() method.
         # character_items = [item for item in all_character_items if item.is_displayed()]
 
@@ -672,8 +692,9 @@ class SupportCardScraper(BaseScraper):
             logging.info(f"buildId not found")
 
         # Get all support card links.
-        support_card_grid = driver.find_element(By.XPATH, "//div[contains(@class, 'sc-dc9ce0a6-0')]")
-        all_support_card_items = support_card_grid.find_elements(By.CSS_SELECTOR, "a.sc-df8b554e-1")
+        # See the note in CharacterScraper.start: href, not generated classes.
+        all_support_card_items = driver.find_elements(
+            By.CSS_SELECTOR, 'a[href*="/umamusume/supports/"]')
         # Filter out hidden elements using Selenium's is_displayed() method.
         # filtered_support_card_items = [item for item in all_support_card_items if item.is_displayed()]
 
@@ -1715,12 +1736,21 @@ if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
     start_time = time.time()
 
-    after_race_events = load_after_race_events()
-    character_scraper = CharacterScraper(after_race_events)
-    character_scraper.start()
-
-    support_card_scraper = SupportCardScraper()
-    support_card_scraper.start()
+    # Support cards no longer come from here. GameTora replaced the tippy
+    # tooltips that held the training-event outcomes with an accordion that
+    # ignores synthetic clicks, so SupportCardScraper has no DOM left to read
+    # and cannot be fixed by adjusting selectors. scrape_supports.py rebuilds
+    # supports.json from the site's own JSON data layer instead - no browser,
+    # ten requests plus one per card, and nothing that can rot with the markup.
+    #
+    # CharacterScraper still reads those same dead tooltips, so characters.json
+    # is stale for anything released since it last ran. It needs the same
+    # treatment; the data layer has training_events/char_card and per-character
+    # payloads ready for it.
+    logging.info("Refreshing support cards from the data layer...")
+    import scrape_supports
+    if scrape_supports.refresh(write=True, validate=True, refresh_manifest=True) != 0:
+        raise SystemExit("Support card refresh failed; not rewriting events.json.")
 
     convert_all("characters.json", "supports.json", "../data/events.json")
 
