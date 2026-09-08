@@ -1,7 +1,8 @@
 from adbutils import adb
 import numpy as np
 import core.bot as bot
-from utils.log import info, debug, error, debug_window, args
+import utils.display as display
+from utils.log import info, debug, error, warning, debug_window, args
 from utils.constants import name_of_variable
 
 device = None
@@ -11,25 +12,29 @@ def init_adb():
     try:
       adb.connect(bot.device_id)
       device = adb.device(bot.device_id)
+      screen, complaint = display.pin(device)
     except Exception as e:
       error(f"Failed to initialize ADB: {e}")
       return False
+    if complaint:
+      warning(complaint)
+    info(f"Reading and tapping {screen}.")
   return True
 
 def click(x, y):
   if device is None:
     return False
-  return device.click(x, y)
+  return display.tap(device, x, y)
 
 def swipe(x1, y1, x2, y2, duration=0.3):
   if device is None:
     return False
-  return device.swipe(x1, y1, x2, y2, duration)
+  return display.swipe(device, x1, y1, x2, y2, duration)
 
 def text(content):
   if device is None:
     return False
-  return device.send_keys(content)
+  return display.text(device, content)
 
 def enable_cursor_display():
   if device is None:
@@ -69,10 +74,10 @@ def screenshot(region_xywh: tuple[int, int, int, int] = None, force_save=False):
   else:
     if args.device_debug:
       debug(f"Taking new screenshot")
-    try:
-      screenshot = np.array(device.screenshot(error_ok=False))
-    except:
-      screenshot = np.array(device.screenshot())
+    # Deliberately not falling back to adbutils' error_ok path: it returns a
+    # black frame, and the bot then chases templates across a blank screen
+    # instead of reporting that capture broke.
+    screenshot = np.array(display.screenshot(device))
     cached_screenshot = screenshot
   if force_save:
     debug_window(screenshot, save_name="adb_screenshot", force_save=force_save)

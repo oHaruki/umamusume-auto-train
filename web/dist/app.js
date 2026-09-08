@@ -12554,7 +12554,7 @@ const minimum_acceptable_scores = { "max_out_friendships": { "use_user_defined_m
 const training_strategy = { "name": "default", "timeline": { "Junior Year Pre-Debut": "max_out_friendships", "Junior Year Late Aug": "max_out_friendships", "Classic Year Early Jan": "max_out_friendships", "Classic Year Early Jun": "rainbow_training", "Classic Year Early Jul": "rainbow_training", "Classic Year Early Sep": "rainbow_training_2", "Senior Year Early Jan": "rainbow_training_2", "Senior Year Early Jul": "rainbow_training_3", "Senior Year Early Sep": "rainbow_training_3", "Finale Underway": "rainbow_training_3" }, "stat_weight_sets": { "set_1": { "spd": 1, "sta": 1, "pwr": 0.8, "guts": 0.5, "wit": 1, "sp": 0.6 } }, "risk_taking_sets": { "set_1": { "rainbow_increase": 5, "normal_increase": 2 } }, "action_sequence_sets": { "set_1": ["infirmary", "training", "recreation", "rest", "race"] }, "target_stat_sets": { "set_1": { "spd": 600, "sta": 400, "pwr": 400, "guts": 300, "wit": 300 }, "set_2": { "spd": 800, "sta": 660, "pwr": 600, "guts": 400, "wit": 400 }, "set_3": { "spd": 1200, "sta": 800, "pwr": 900, "guts": 400, "wit": 400 } }, "templates": { "do_most_cards": { "training_function": "most_support_cards", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_1" }, "max_out_friendships": { "training_function": "max_out_friendships", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_1" }, "most_stat_gain": { "training_function": "most_stat_gain", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_1" }, "most_stat_gain_2": { "training_function": "most_stat_gain", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_2" }, "most_stat_gain_3": { "training_function": "most_stat_gain", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_3" }, "rainbow_training": { "training_function": "rainbow_training", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_1" }, "rainbow_training_2": { "training_function": "rainbow_training", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_2" }, "rainbow_training_3": { "training_function": "rainbow_training", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_3" }, "meta_training": { "training_function": "meta_training", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_1" }, "meta_training_2": { "training_function": "meta_training", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_2" }, "meta_training_3": { "training_function": "meta_training", "action_sequence_set": "set_1", "risk_taking_set": "set_1", "stat_weight_set": "set_1", "target_stat_set": "set_3" } } };
 const window_name = "Bluestacks Umamusume";
 const preset_id = "default";
-const autopilot = { "borrow_card_targets": [], "borrow_required": true, "borrow_max_scrolls": 8, "borrow_max_reloads": 3, "borrow_match_threshold": 0.8, "use_agenda": false, "buy_leftover_skills": false, "max_skill_visits": 5, "wait_when_out_of_tp": true, "idle_poll_seconds": 20 };
+const autopilot = { "devices": [], "borrow_card_targets": [], "borrow_required": true, "borrow_max_scrolls": 8, "borrow_max_reloads": 3, "borrow_match_threshold": 0.8, "use_agenda": false, "buy_leftover_skills": false, "max_skill_visits": 5, "wait_when_out_of_tp": true, "idle_poll_seconds": 20, "auto_recover_tp": false, "tp_min": 30, "tp_recover_uses": 1, "tp_recover_max_attempts": 3 };
 const rawConfig = {
   config_name,
   theme,
@@ -17166,7 +17166,17 @@ const FunctionFallbacksBase = object({
 const FunctionFallbacksSchema = FunctionFallbacksBase.default(
   FunctionFallbacksBase.parse({})
 );
+const DeviceEntrySchema = union([
+  string(),
+  object({
+    id: string(),
+    borrow_card_targets: array(string()).optional()
+  })
+]);
 const AutopilotSchema = object({
+  // The emulators to drive at once, one client each. Empty falls back to the
+  // single Device ID on the Set-Up tab.
+  devices: array(DeviceEntrySchema).default([]),
   // Support cards to borrow, best first. Written as they appear in game;
   // matching normalises punctuation, so "[Q!=0] Agnes Tachyon" and the real
   // "[Q<>0] Agnes Tachyon" both resolve to the same card.
@@ -17185,7 +17195,13 @@ const AutopilotSchema = object({
   // Complete Career and the Learn screen.
   max_skill_visits: number().default(5),
   wait_when_out_of_tp: boolean().default(true),
-  idle_poll_seconds: number().default(20)
+  idle_poll_seconds: number().default(20),
+  // Spend carats on TP from Home when a run cannot be afforded. Off by
+  // default: it costs real currency.
+  auto_recover_tp: boolean().default(false),
+  tp_min: number().default(30),
+  tp_recover_uses: number().default(1),
+  tp_recover_max_attempts: number().default(3)
 });
 const ConfigSchema = object({
   config_name: string(),
@@ -33516,83 +33532,42 @@ function SkillSection$1({ config: config2, updateConfig, forAutopilot }) {
   ] });
 }
 const toCharacterName = (pickerName) => pickerName.split("(")[0].trim();
-const FALLBACK = {
-  borrow_card_targets: [],
-  borrow_required: true,
-  borrow_max_scrolls: 8,
-  borrow_max_reloads: 3,
-  borrow_match_threshold: 0.8,
-  use_agenda: false,
-  buy_leftover_skills: false,
-  max_skill_visits: 5,
-  wait_when_out_of_tp: true,
-  idle_poll_seconds: 20
-};
-function AutopilotSection({ config: config2, updateConfig }) {
-  const autopilot2 = config2.autopilot ?? FALLBACK;
+function CardTargets({
+  value,
+  onChange,
+  supportCards,
+  emptyText,
+  compact = false
+}) {
   const [draft, setDraft] = reactExports.useState("");
-  const { data: events2 } = useQuery({
-    queryKey: ["events"],
-    queryFn: async () => {
-      const res = await fetch("/data/events.json");
-      if (!res.ok) throw new Error("Failed to fetch events");
-      return res.json();
-    },
-    staleTime: 10 * 60 * 1e3
-  });
-  const supportCards = events2?.supportCardArraySchema?.supportCards ?? [];
-  const set = (patch) => updateConfig("autopilot", { ...autopilot2, ...patch });
-  const add2 = (value) => {
-    const trimmed = value.trim();
-    if (!trimmed || autopilot2.borrow_card_targets.includes(trimmed)) return;
-    set({ borrow_card_targets: [...autopilot2.borrow_card_targets, trimmed] });
+  const add2 = (name) => {
+    const trimmed = name.trim();
+    if (!trimmed || value.includes(trimmed)) return;
+    onChange([...value, trimmed]);
   };
-  const addTarget = () => {
+  const addDraft = () => {
     add2(draft);
     setDraft("");
   };
-  const removeTarget = (value) => set({
-    borrow_card_targets: autopilot2.borrow_card_targets.filter((t) => t !== value)
-  });
   const move = (index2, delta) => {
-    const next = [...autopilot2.borrow_card_targets];
+    const next = [...value];
     const target = index2 + delta;
     if (target < 0 || target >= next.length) return;
     [next[index2], next[target]] = [next[target], next[index2]];
-    set({ borrow_card_targets: next });
+    onChange(next);
   };
-  return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "section-card", children: [
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("h2", { className: "text-3xl font-semibold mb-4 flex items-center gap-3", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsx(Bot, { className: "text-primary" }),
-      "Autopilot"
-    ] }),
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { className: "text-sm text-muted-foreground mb-4", children: [
-      "Runs Independent Training back to back: borrows a support card, starts the run, buys skills when it ends, then starts the next one. Press",
-      " ",
-      /* @__PURE__ */ jsxRuntimeExports.jsx("kbd", { className: "px-1 py-0.5 rounded bg-muted font-mono", children: "F2" }),
-      " to start and stop it, or run",
-      " ",
-      /* @__PURE__ */ jsxRuntimeExports.jsx("code", { className: "px-1 py-0.5 rounded bg-muted", children: "py -3.12 autopilot_run.py" }),
-      " ",
-      "separately. What it buys at the end of a run is set in the two Skill sections below."
-    ] }),
-    /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-lg font-medium mb-1", children: "Support cards to borrow" }),
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { className: "text-sm text-muted-foreground mb-3", children: [
-      "Pick from the card list, or type a name. Matching reads the borrow list as text and ignores punctuation, so",
-      /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "whitespace-nowrap", children: " “[Q≠0] Agnes Tachyon”" }),
-      " and “Agnes Tachyon” both work. Topmost entry wins when several are available."
-    ] }),
-    /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex gap-2 mb-2", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
-      EventDialog,
-      {
-        button: "Select Support Card",
-        data: supportCards,
-        setSelected: (value) => {
-          if (typeof value === "string") add2(toCharacterName(value));
-        }
-      }
-    ) }),
+  return /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
     /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex gap-2 mb-2", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx(
+        EventDialog,
+        {
+          button: compact ? "Pick" : "Select Support Card",
+          data: supportCards,
+          setSelected: (v) => {
+            if (typeof v === "string") add2(toCharacterName(v));
+          }
+        }
+      ),
       /* @__PURE__ */ jsxRuntimeExports.jsx(
         Input,
         {
@@ -33602,20 +33577,19 @@ function AutopilotSection({ config: config2, updateConfig }) {
           onKeyDown: (e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              addTarget();
+              addDraft();
             }
           }
         }
       ),
-      /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { type: "button", onClick: addTarget, disabled: !draft.trim(), children: "Add" })
+      /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { type: "button", onClick: addDraft, disabled: !draft.trim(), children: "Add" })
     ] }),
-    /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-xs text-muted-foreground mb-3", children: "The card list carries character names only, not card titles, and it lags behind new releases — SSR Agnes Tachyon is missing from it, for instance. Type the name by hand for anything absent, or to tell two cards of the same character apart." }),
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-2 mb-6", children: [
-      autopilot2.borrow_card_targets.length === 0 && /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-sm text-muted-foreground italic", children: "No cards yet. With none set the bot stops at the borrow list rather than picking something unintended." }),
-      autopilot2.borrow_card_targets.map((target, index2) => /* @__PURE__ */ jsxRuntimeExports.jsxs(
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-2", children: [
+      value.length === 0 && /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-sm text-muted-foreground italic", children: emptyText }),
+      value.map((target, index2) => /* @__PURE__ */ jsxRuntimeExports.jsxs(
         "div",
         {
-          className: "px-3 py-2 border-2 border-border rounded-lg flex items-center gap-3",
+          className: `border-2 border-border rounded-lg flex items-center gap-3 ${compact ? "px-2 py-1 text-sm" : "px-3 py-2"}`,
           children: [
             /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "text-sm text-muted-foreground w-6", children: [
               index2 + 1,
@@ -33639,7 +33613,7 @@ function AutopilotSection({ config: config2, updateConfig }) {
                 type: "button",
                 className: "px-2 text-muted-foreground hover:text-foreground disabled:opacity-30 cursor-pointer",
                 onClick: () => move(index2, 1),
-                disabled: index2 === autopilot2.borrow_card_targets.length - 1,
+                disabled: index2 === value.length - 1,
                 "aria-label": "Move down",
                 children: "↓"
               }
@@ -33649,7 +33623,7 @@ function AutopilotSection({ config: config2, updateConfig }) {
               {
                 type: "button",
                 className: "px-2 text-muted-foreground hover:text-destructive cursor-pointer",
-                onClick: () => removeTarget(target),
+                onClick: () => onChange(value.filter((t) => t !== target)),
                 "aria-label": `Remove ${target}`,
                 children: /* @__PURE__ */ jsxRuntimeExports.jsx(X$1, { className: "w-4 h-4" })
               }
@@ -33658,7 +33632,178 @@ function AutopilotSection({ config: config2, updateConfig }) {
         },
         target
       ))
+    ] })
+  ] });
+}
+const deviceId = (entry) => typeof entry === "string" ? entry : entry.id;
+const ownCards = (entry) => typeof entry === "string" ? void 0 : entry.borrow_card_targets;
+const FALLBACK = {
+  devices: [],
+  borrow_card_targets: [],
+  borrow_required: true,
+  borrow_max_scrolls: 8,
+  borrow_max_reloads: 3,
+  borrow_match_threshold: 0.8,
+  use_agenda: false,
+  buy_leftover_skills: false,
+  max_skill_visits: 5,
+  wait_when_out_of_tp: true,
+  idle_poll_seconds: 20,
+  auto_recover_tp: false,
+  tp_min: 30,
+  tp_recover_uses: 1,
+  tp_recover_max_attempts: 3
+};
+function AutopilotSection({ config: config2, updateConfig }) {
+  const autopilot2 = { ...FALLBACK, ...config2.autopilot ?? {} };
+  const [deviceDraft, setDeviceDraft] = reactExports.useState("");
+  const { data: events2 } = useQuery({
+    queryKey: ["events"],
+    queryFn: async () => {
+      const res = await fetch("/data/events.json");
+      if (!res.ok) throw new Error("Failed to fetch events");
+      return res.json();
+    },
+    staleTime: 10 * 60 * 1e3
+  });
+  const supportCards = events2?.supportCardArraySchema?.supportCards ?? [];
+  const set = (patch) => updateConfig("autopilot", { ...autopilot2, ...patch });
+  const devices = autopilot2.devices ?? [];
+  const ids2 = devices.map(deviceId);
+  const setDevice = (index2, entry) => {
+    const next = [...devices];
+    next[index2] = entry;
+    set({ devices: next });
+  };
+  const setDeviceCards = (index2, cards) => {
+    const id = deviceId(devices[index2]);
+    setDevice(index2, cards === void 0 ? id : { id, borrow_card_targets: cards });
+  };
+  const addDevice = () => {
+    const added = deviceDraft.split(/[\s,;]+/).map((d) => d.trim()).filter((d) => d && !ids2.includes(d));
+    if (!added.length) return;
+    set({ devices: [...devices, ...new Set(added)] });
+    setDeviceDraft("");
+  };
+  const removeDevice = (index2) => set({ devices: devices.filter((_d, i) => i !== index2) });
+  return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "section-card", children: [
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("h2", { className: "text-3xl font-semibold mb-4 flex items-center gap-3", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx(Bot, { className: "text-primary" }),
+      "Autopilot"
     ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { className: "text-sm text-muted-foreground mb-4", children: [
+      "Runs Independent Training back to back: borrows a support card, starts the run, buys skills when it ends, then starts the next one. Press",
+      " ",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("kbd", { className: "px-1 py-0.5 rounded bg-muted font-mono", children: "F2" }),
+      " to start and stop it, or run",
+      " ",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("code", { className: "px-1 py-0.5 rounded bg-muted", children: "py -3.12 autopilot_run.py" }),
+      " ",
+      "separately. What it buys at the end of a run is set in the two Skill sections below."
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-lg font-medium mb-1", children: "Clients" }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { className: "text-sm text-muted-foreground mb-3", children: [
+      "ADB ids of the emulators to drive, one autopilot each, all at once. Add them together separated by commas or spaces, or one at a time. Leave empty to drive the single Device ID from the Set-Up tab. Every client gets its own window into",
+      " ",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("code", { className: "px-1 py-0.5 rounded bg-muted", children: "logs/<port>/" }),
+      ". They share the settings on this page, except that each can borrow its own card."
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex gap-2 mb-2", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx(
+        Input,
+        {
+          placeholder: "127.0.0.1:7555, 127.0.0.1:16416",
+          value: deviceDraft,
+          onChange: (e) => setDeviceDraft(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              addDevice();
+            }
+          }
+        }
+      ),
+      /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { type: "button", onClick: addDevice, disabled: !deviceDraft.trim(), children: "Add" })
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { className: "text-xs text-muted-foreground mb-3", children: [
+      "Each one needs its own emulator instance at 800 x 1080 with ADB on, and each runs a full copy of the bot — roughly a gigabyte of memory and a core apiece. Every instance has its own port: MuMu’s first two are usually",
+      " ",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("code", { className: "px-1 py-0.5 rounded bg-muted", children: "127.0.0.1:7555" }),
+      " and",
+      " ",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("code", { className: "px-1 py-0.5 rounded bg-muted", children: "127.0.0.1:16416" }),
+      ", while BlueStacks uses 5555 and 5565. Run",
+      " ",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("code", { className: "px-1 py-0.5 rounded bg-muted", children: "py -3.12 autopilot/tools/devices.py" }),
+      " ",
+      "to list what is actually reachable."
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-2 mb-6", children: [
+      devices.length === 0 && /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-sm text-muted-foreground italic", children: "No clients listed. The Device ID on the Set-Up tab is used on its own." }),
+      devices.map((entry, index2) => {
+        const id = deviceId(entry);
+        const cards = ownCards(entry);
+        return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "px-3 py-2 border-2 border-border rounded-lg", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-3", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "text-sm text-muted-foreground w-6", children: [
+              index2 + 1,
+              "."
+            ] }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "flex-1 font-mono text-sm", children: id }),
+            /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "flex items-center gap-2 text-sm cursor-pointer", children: [
+              /* @__PURE__ */ jsxRuntimeExports.jsx(
+                Checkbox,
+                {
+                  id: `own-cards-${id}`,
+                  checked: cards !== void 0,
+                  onCheckedChange: () => setDeviceCards(index2, cards === void 0 ? [] : void 0)
+                }
+              ),
+              "Own cards"
+            ] }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                type: "button",
+                className: "px-2 text-muted-foreground hover:text-destructive cursor-pointer",
+                onClick: () => removeDevice(index2),
+                "aria-label": `Remove ${id}`,
+                children: /* @__PURE__ */ jsxRuntimeExports.jsx(X$1, { className: "w-4 h-4" })
+              }
+            )
+          ] }),
+          cards !== void 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "mt-3 pl-9", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-xs text-muted-foreground mb-2", children: "Borrowed on this client instead of the shared list below. Everything else still comes from the settings on this page." }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              CardTargets,
+              {
+                value: cards,
+                onChange: (next) => setDeviceCards(index2, next),
+                supportCards,
+                emptyText: "Nothing set, so this client stops at the borrow list rather than picking something unintended.",
+                compact: true
+              }
+            )
+          ] })
+        ] }, id);
+      })
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-lg font-medium mb-1", children: "Support cards to borrow" }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { className: "text-sm text-muted-foreground mb-3", children: [
+      "Used by every client that does not have its own list above. Pick from the card list, or type a name. Matching reads the borrow list as text and ignores punctuation, so",
+      /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "whitespace-nowrap", children: " “[Q≠0] Agnes Tachyon”" }),
+      " and “Agnes Tachyon” both work. Topmost entry wins when several are available."
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsx(
+      CardTargets,
+      {
+        value: autopilot2.borrow_card_targets,
+        onChange: (next) => set({ borrow_card_targets: next }),
+        supportCards,
+        emptyText: "No cards yet. With none set the bot stops at the borrow list rather than picking something unintended."
+      }
+    ),
+    /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-xs text-muted-foreground mt-3 mb-6", children: "The card list carries character names only, not card titles, and it lags behind new releases — SSR Agnes Tachyon is missing from it, for instance. Type the name by hand for anything absent, or to tell two cards of the same character apart." }),
     /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "grid lg:grid-cols-3 grid-cols-1 gap-2", children: [
       /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "uma-label col-span-3", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsx(
@@ -33765,6 +33910,60 @@ function AutopilotSection({ config: config2, updateConfig }) {
             min: 1,
             value: autopilot2.idle_poll_seconds,
             onChange: (e) => set({ idle_poll_seconds: e.target.valueAsNumber })
+          }
+        )
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "uma-label col-span-3", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          Checkbox,
+          {
+            id: "auto-recover-tp",
+            checked: autopilot2.auto_recover_tp,
+            onCheckedChange: () => set({ auto_recover_tp: !autopilot2.auto_recover_tp })
+          }
+        ),
+        "Auto Recover TP",
+        /* @__PURE__ */ jsxRuntimeExports.jsx(Tooltips, { children: "When Home shows less TP than the threshold below, press + beside the TP bar and spend carats on a refill before starting the next run. This costs real carats every time — 10 for 30 TP. Off by default." })
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "uma-label", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { children: "Refill Below (TP)" }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(Tooltips, { children: "Refill when Home shows less TP than this. A run costs 15 and one refill gives 30, so 30 keeps a run always affordable." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          Input,
+          {
+            className: "w-20",
+            type: "number",
+            min: 1,
+            value: autopilot2.tp_min,
+            onChange: (e) => set({ tp_min: e.target.valueAsNumber })
+          }
+        )
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "uma-label", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { children: "Refills Per Top-Up" }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(Tooltips, { children: "How many times to press + in the recovery dialog. Each press is 10 carats for 30 TP, and TP over the cap is kept rather than lost." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          Input,
+          {
+            className: "w-20",
+            type: "number",
+            min: 1,
+            value: autopilot2.tp_recover_uses,
+            onChange: (e) => set({ tp_recover_uses: e.target.valueAsNumber })
+          }
+        )
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "uma-label", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { children: "Max Refills In A Row" }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(Tooltips, { children: "Safety cap. If TP has not come back up after this many refills something is wrong with the dialog, so the bot stops spending rather than buying in a loop. Resets as soon as TP reads healthy." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          Input,
+          {
+            className: "w-20",
+            type: "number",
+            min: 1,
+            value: autopilot2.tp_recover_max_attempts,
+            onChange: (e) => set({ tp_recover_max_attempts: e.target.valueAsNumber })
           }
         )
       ] }),

@@ -20,7 +20,7 @@ SETUP_KEYS = [
 ]
 
 # one level deep merge on only whitelisted keys
-NESTED_SHALLOW_KEYS = ["skill","stat_caps","minimum_aptitudes","positions_by_race","hint_hunting_weights","event"]
+NESTED_SHALLOW_KEYS = ["skill","stat_caps","minimum_aptitudes","positions_by_race","hint_hunting_weights","event","autopilot"]
 
 def update_config(file_path=None):
   global is_changed, NESTED_SHALLOW_KEYS, TEMPLATE_FILE, CONFIG_FILE

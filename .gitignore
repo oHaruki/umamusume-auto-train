@@ -45,3 +45,6 @@ assets/notifications/*
 
 # GameTora data-layer cache (devtools/scrape_supports.py)
 devtools/.gtcache/
+
+# Screenshots from autopilot/tools/devices.py --shot
+device_shots/

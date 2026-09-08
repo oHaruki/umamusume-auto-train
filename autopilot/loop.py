@@ -12,6 +12,8 @@ a misread from turning into a stray tap.
 
 from __future__ import annotations
 
+import os
+import re
 import time
 
 from PIL import Image
@@ -20,7 +22,7 @@ import core.bot as bot
 import core.config as core_config
 import utils.constants as constants
 import utils.device_action_wrapper as device_action
-from core.ocr import extract_number, get_reader
+from core.ocr import extract_allowed_text, extract_number, get_reader
 from core.recognizer import compare_brightness
 from core.skill import buy_skill, init_skill_py
 from utils.adb_actions import init_adb
@@ -34,14 +36,19 @@ from autopilot import config as auto_config
 from autopilot.borrow_match import duplicate_row_indexes, find_best, parse_rows
 from autopilot.screens import (
   BORROW_ALLOWLIST, BORROW_LIST_LTRB, BORROW_ROW_X, BORROW_SCROLL_FROM,
-  BORROW_RELOAD_BUTTON, BORROW_SCROLL_TO, DUPLICATE_BADGE, EDIT_AGENDA_BUTTON,
-  FRIENDS_SLOT_EMPTY, LOAD_LIST_BUTTON,
-  MATCH_THRESHOLD, MY_AGENDAS_BUTTON, NORMAL_MODE_LABEL, SCREENS,
-  SKILL_POINTS_LTRB, TP_LTRB, TP_TIME_LTRB, SKILLS_BUTTON, START_BUTTON, START_CAREER_BUTTON,TP_EVENT_BUTTON, NEXT_BUTTON,
+  BORROW_RELOAD_BUTTON, BORROW_SCROLL_TO, CAREER_BUTTON, DUPLICATE_BADGE,
+  EDIT_AGENDA_BUTTON, FRIENDS_SLOT_EMPTY, HOME_TP_PLUS_POS, HOME_TP_TEXT_LTRB,
+  LOAD_LIST_BUTTON, MATCH_THRESHOLD, MY_AGENDAS_BUTTON, NEXT_BUTTON,
+  NORMAL_MODE_LABEL, SCREENS, SKILL_POINTS_LTRB, SKILLS_BUTTON, START_BUTTON,
+  START_CAREER_BUTTON, TP_AMOUNT_PLUS, TP_CARATS_ITEM, TP_EVENT_BUTTON, TP_LTRB,
+  TP_ROW_TOLERANCE, TP_TEMPLATES, TP_TIME_LTRB, TP_USE_BUTTON,
 )
 
+CANCEL_BUTTON = "assets/buttons/cancel_btn.png"
 CLOSE_BUTTON = "assets/buttons/close_btn.png"
 CONFIRM_BUTTON = "assets/buttons/confirm_btn.png"
+# The amount dialog's confirm button is the same asset the training log uses.
+OK_BUTTON = "assets/buttons/ok_btn.png"
 
 # Consecutive unsettled checks before acting on the latest reading anyway.
 FORCE_ACT_AFTER = 8
@@ -53,6 +60,11 @@ LIST_STILL_DIFF = 1.0
 # Scroll passes when spending leftover points. Bounded so a skill screen that
 # never reports reaching its end cannot loop forever.
 MAX_LEFTOVER_PASSES = 15
+
+# TP one Independent Training run costs. Distinct from the configured tp_min,
+# which is only the level below which the bot tops up: at 20 TP there is no
+# need to buy anything and no reason to wait either, the run can just start.
+RUN_TP_COST = 15
 
 
 class Autopilot:
@@ -67,11 +79,28 @@ class Autopilot:
     self.idle_streak = 0
     self.settling_streak = 0
     self.repeat_count = 0
+    # Refills since TP was last seen at or above tp_min. Reset on a healthy
+    # reading, so it caps a runaway, not the session's total spending.
+    self.tp_recoveries = 0
+    self.waiting_for_tp = False
+    self.tp_templates_ok = None
+    # Set by a handler that has decided there is nothing to do for a while,
+    # so the loop waits instead of re-reading the same screen every second.
+    self.long_wait = False
+
+    # A template file that is not there makes cv2.imread() return None and
+    # match_template() fail on .shape, which would take down the whole loop
+    # over one screen. Dropping the rule instead costs only that screen.
+    self.screens = tuple(s for s in SCREENS if os.path.exists(s.identify))
+    missing = [s.name for s in SCREENS if not os.path.exists(s.identify)]
+    if missing:
+      warning(f"No template for {', '.join(missing)}; those screens will not be "
+              "recognised. See autopilot/tools/cut_template.py.")
 
   # --- screen reading -------------------------------------------------
   def identify(self):
     """First matching entry of the table, or (None, None)."""
-    for screen in SCREENS:
+    for screen in self.screens:
       pos = device_action.locate(screen.identify, confidence=MATCH_THRESHOLD,
                                  region_ltrb=screen.identify_region)
       if pos:
@@ -129,6 +158,36 @@ class Autopilot:
     seconds = rawtime % 100
     return minutes * 60 + seconds
   
+  def read_tp(self) -> tuple[int, int]:
+    """(current, max) off Home's TP counter, or (-1, -1) if unreadable.
+
+    The slash is part of the allowlist on purpose. Reading digits only would
+    turn "92/100" into 92100, and there is no way to split that back apart
+    once TP goes to three digits.
+    """
+    crop = device_action.screenshot(region_ltrb=HOME_TP_TEXT_LTRB)
+    pil = Image.fromarray(crop)
+    pil = pil.resize((pil.width * 3, pil.height * 3), Image.BICUBIC)
+    text = extract_allowed_text(pil, allowlist="0123456789/")
+    # Read as one token normally; the spaces are only stripped as a fallback,
+    # for when the recogniser hands back "92 / 100" in three pieces.
+    found = re.search(r"(\d+)/(\d+)", text) or re.search(r"(\d+)/(\d+)", text.replace(" ", ""))
+    if not found:
+      debug(f"TP counter read as {text!r}, which is not an X/Y reading.")
+      return -1, -1
+    return int(found.group(1)), int(found.group(2))
+
+  def recover_tp_available(self) -> bool:
+    """Whether the Recover TP templates are all present. Warns once."""
+    if self.tp_templates_ok is None:
+      missing = [t for t in TP_TEMPLATES if not os.path.exists(t)]
+      self.tp_templates_ok = not missing
+      if missing:
+        warning("TP recovery is switched on but these templates are missing, so it "
+                f"stays off: {', '.join(missing)}. Cut them with "
+                "autopilot/tools/cut_template.py.")
+    return self.tp_templates_ok
+
   def duplicate_badge_ys(self) -> list[int]:
     """Y positions of every "Duplicate Support" badge currently on screen."""
     frame = device_action.screenshot()
@@ -185,6 +244,122 @@ class Autopilot:
         info("Wait for TP set to false, exiting")
         bot.is_bot_running = False
   
+  def do_home(self, screen):
+    """Top up TP if it is running out, otherwise open Career.
+
+    Home is the only screen that shows the TP total, and it is the last point
+    before a run is committed, so the check belongs here rather than at the
+    Final Confirmation screen where a refill would mean backing out again.
+    """
+    tp, cap = -1, -1
+    if self.cfg.auto_recover_tp or self.cfg.wait_when_out_of_tp:
+      tp, cap = self.read_tp()
+      if tp < 0:
+        warning("Could not read Home's TP counter; going ahead with the run.")
+
+    if tp >= 0:
+      if tp >= self.cfg.tp_min:
+        self.tp_recoveries = 0
+      elif self.cfg.auto_recover_tp and self.recover_tp_available():
+        if self.tp_recoveries < self.cfg.tp_recover_max_attempts:
+          self.tp_recoveries += 1
+          info(f"TP is {tp}/{cap}, under {self.cfg.tp_min}. Buying more "
+               f"(attempt {self.tp_recoveries} of {self.cfg.tp_recover_max_attempts}).")
+          # Tapped by position, not by template: the TP, RP and carats + buttons
+          # in the top bar are the same image, so a match could pick any of them
+          # and buying RP or carats by accident is not recoverable.
+          device_action.click(HOME_TP_PLUS_POS)
+          return
+        warning(f"TP is still {tp}/{cap} after {self.tp_recoveries} refills, so the "
+                "dialog is not doing what is expected. Spending no more carats "
+                "until TP recovers on its own.")
+
+      if tp < RUN_TP_COST and self.cfg.wait_when_out_of_tp:
+        if not self.waiting_for_tp:
+          info(f"TP is {tp}/{cap}, under the {RUN_TP_COST} a run costs. Waiting for "
+               "it to regenerate.")
+          self.waiting_for_tp = True
+        self.long_wait = True
+        return
+
+    self.waiting_for_tp = False
+    device_action.locate_and_click(CAREER_BUTTON, confidence=MATCH_THRESHOLD)
+
+  def do_recover_tp(self, screen):
+    """Drive the Recover TP dialogs: pick Carats, set the amount, confirm.
+
+    Which of the three dialogs is up is worked out from what is drawn on it,
+    never from a step counter. A lost tap or a start made halfway through then
+    costs one tick rather than leaving the flow stranded.
+    """
+    ok = device_action.locate(OK_BUTTON, confidence=MATCH_THRESHOLD)
+    if ok:
+      self.confirm_tp_amount(ok)
+      return
+
+    if self.use_carats_row():
+      return
+
+    # No amount dialog and no row we are willing to press: either the receipt
+    # after a purchase, or a list without Carats in it. Closing is right for
+    # both and lands back on Home, where the TP check runs again.
+    info("Nothing further to do on the TP dialog, closing it.")
+    if not device_action.locate_and_click(CLOSE_BUTTON, confidence=MATCH_THRESHOLD):
+      warning("No Close button on the TP dialog; leaving it alone rather than "
+              "tapping blind.")
+
+  def use_carats_row(self) -> bool:
+    """Press Use on the Carats row. False if that row is not on screen.
+
+    The row is found by its thumbnail and the Use button beside it, rather than
+    by taking the topmost Use: the item list is scrollable and its order is the
+    game's to change, and every other row spends something that cannot be
+    bought back.
+    """
+    frame = device_action.screenshot()
+    uses = device_action.match_template(TP_USE_BUTTON, frame, threshold=MATCH_THRESHOLD)
+    if not uses:
+      return False
+
+    carats = device_action.match_template(TP_CARATS_ITEM, frame, threshold=MATCH_THRESHOLD)
+    if not carats:
+      warning("Carats are not on the TP item list. Not pressing Use on some other "
+              "item instead.")
+      return False
+
+    _x, y, _w, h = carats[0]
+    row_y = y + h // 2
+    button = min(uses, key=lambda b: abs(b[1] + b[3] // 2 - row_y))
+    if abs(button[1] + button[3] // 2 - row_y) > TP_ROW_TOLERANCE:
+      warning("Found the Carats row but no Use button level with it.")
+      return False
+
+    info("Using Carats to recover TP.")
+    device_action.click(button)
+    return True
+
+  def confirm_tp_amount(self, ok_pos) -> None:
+    """Raise the amount off zero, then confirm. The dialog opens at zero."""
+    plus = device_action.locate(TP_AMOUNT_PLUS, confidence=MATCH_THRESHOLD)
+    if plus is None:
+      warning("The amount dialog is up but its + button was not found. Cancelling "
+              "rather than confirming an amount that was never set.")
+      if not device_action.locate_and_click(CANCEL_BUTTON, confidence=MATCH_THRESHOLD):
+        warning("Cancel not found either; leaving the dialog as it is.")
+      return
+
+    presses = max(1, self.cfg.tp_recover_uses)
+    info(f"Raising the amount: pressing + {presses} time(s).")
+    for _ in range(presses):
+      # The same coordinates every time rather than a fresh match per press:
+      # + greys out once the maximum is reached and stops matching, which
+      # would look like a failure halfway through a run of presses.
+      device_action.click(plus)
+      sleep(0.25)
+
+    info("Confirming the purchase.")
+    device_action.click(ok_pos)
+
   def do_formation(self, screen):
     """Borrow first if the slot is still empty, otherwise start the career."""
     if device_action.locate(FRIENDS_SLOT_EMPTY, confidence=MATCH_THRESHOLD):
@@ -409,6 +584,7 @@ class Autopilot:
   # --- one tick -------------------------------------------------------
   def step(self) -> str:
     """Act once. Returns "acted", "settling" or "idle"."""
+    self.long_wait = False
     device_action.flush_screenshot_cache()
     screen, _, status = self.identify_settled()
 
@@ -460,6 +636,12 @@ class Autopilot:
       if not device_action.locate_and_click(screen.click, confidence=MATCH_THRESHOLD):
         warning(f"Could not find {screen.click} to click on {screen.name}.")
 
+    # Sitting on Home on purpose while TP regenerates is not the same as
+    # clicking Home over and over with nothing happening, and should not be
+    # reported as a stuck click.
+    if self.long_wait:
+      self.repeat_count = 0
+
     if screen.name == "career_complete":
       self.runs_completed += 1
       info(f"Run finished. Completed this session: {self.runs_completed}.")
@@ -467,15 +649,41 @@ class Autopilot:
     return "acted"
 
 
-def run() -> None:
-  cfg = auto_config.load()
+def run(device_id: str | None = None) -> None:
+  """Drive one client. `device_id` overrides the one in config.json.
+
+  Every client the supervisor starts gets its own process, so the module-level
+  state this reaches through - the ADB handle, the screenshot cache, the OCR
+  reader, bot.is_bot_running - belongs to that client alone.
+  """
+  # Per-client settings laid over the shared ones, so two clients can differ
+  # in the card they borrow while sharing everything else.
+  cfg = auto_config.load_for(device_id)
   core_config.reload_config()
 
   bot.use_adb = core_config.USE_ADB
-  if core_config.DEVICE_ID:
+  if device_id:
+    bot.device_id = device_id
+  elif core_config.DEVICE_ID:
     bot.device_id = core_config.DEVICE_ID
   if not bot.use_adb:
     error("Autopilot supports ADB only. Set use_adb in config.json.")
+    bot.is_bot_running = False
+    return
+
+  # One bot per emulator. Restarting the fleet before the previous one has
+  # finished exiting would otherwise put two on the same screen, each undoing
+  # the other's taps - and the first sign of it is the log files failing to
+  # rotate, which is a long way from the cause. Claimed here rather than in
+  # the supervisor so the single-client and standalone paths are covered too.
+  # Imported late: the supervisor imports this module.
+  from autopilot.supervisor import claim_device, label_for
+  device_lock = claim_device(label_for(bot.device_id))
+  if device_lock is None:
+    error(f"Another autopilot is already driving {bot.device_id}. Not starting a "
+          "second one - two bots on one emulator undo each other's taps. Stop "
+          "the first one and try again.")
+    bot.is_bot_running = False
     return
 
   # Same shift main.py applies for ADB, which puts GAME_WINDOW_BBOX at
@@ -483,10 +691,28 @@ def run() -> None:
   constants.adjust_constants_x_coords(offset=-155)
   if not init_adb():
     error("Could not reach the device over ADB.")
+    # Cleared on every exit path, not just the loop's own: a worker's stop
+    # watcher waits on this flag, and leaving it raised keeps that thread
+    # spinning after there is nothing left for it to watch. The lock goes the
+    # same way - a process that stays alive after a failed start must not keep
+    # holding the client.
+    bot.is_bot_running = False
+    try:
+      device_lock.close()
+    except Exception:
+      pass
     return
 
   pilot = Autopilot(cfg)
-  info(f"Autopilot started. Borrow targets: {cfg.borrow_card_targets or '(none configured)'}")
+  own = auto_config.load().device_overrides.get(bot.device_id) or {}
+  whose = "its own" if "borrow_card_targets" in own else "shared"
+  info(f"Autopilot started on {bot.device_id}. "
+       f"Borrow targets ({whose}): {cfg.borrow_card_targets or '(none configured)'}")
+  if own:
+    info(f"Settings this client overrides: {', '.join(sorted(own))}.")
+  if cfg.auto_recover_tp:
+    info(f"TP recovery on: below {cfg.tp_min} TP, Home spends carats "
+         f"({cfg.tp_recover_uses} press(es) of +) before starting a run.")
 
   # A short unrecognised gap is a screen transition or a load, and resolves in
   # seconds; a sustained one is the 50 minutes of training, where polling hard
@@ -510,7 +736,9 @@ def run() -> None:
     while bot.is_bot_running:
       status = pilot.step()
       if status == "acted":
-        rest(1.0)
+        # A handler that has decided to wait out something slow - TP
+        # regenerating - has no reason to be asked again a second later.
+        rest(cfg.idle_poll_seconds if pilot.long_wait else 1.0)
       elif status == "settling":
         rest(0.3)
       else:
@@ -521,4 +749,10 @@ def run() -> None:
     info("Interrupted.")
   finally:
     bot.is_bot_running = False
+    # Matters for the in-thread path, where the process outlives the run and
+    # would otherwise refuse to start again.
+    try:
+      device_lock.close()
+    except Exception:
+      pass
     info(f"Autopilot stopped after {pilot.runs_completed} completed run(s).")

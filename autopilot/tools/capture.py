@@ -35,22 +35,56 @@ import numpy as np
 from adbutils import adb
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+from utils import display  # noqa: E402
+
+
+def default_device() -> str:
+  """The first client from config.json, so these tools point where the bot does.
+
+  Prefers the Device ID on the Set-Up tab, which is the one client a single-
+  client setup uses and the one most people mean by "the emulator"; the
+  Autopilot tab's Clients list is only a fallback, and picking its first entry
+  meant these tools pointed at whichever client happened to be listed first.
+
+  A hardcoded default is worse than either: 127.0.0.1:5555 is BlueStacks' port,
+  and on a MuMu setup it names an emulator that does not exist, which fails as
+  "device not found" rather than as "you forgot --device".
+  """
+  try:
+    import json
+    with open(REPO_ROOT / "config.json", "r", encoding="utf-8") as f:
+      single = str(json.load(f).get("device_id", "")).strip()
+    if single:
+      return single
+  except Exception:
+    pass
+  try:
+    from autopilot import config as auto_config
+    devices = auto_config.resolve_devices(str(REPO_ROOT / "config.json"))
+    if devices:
+      return devices[0]
+  except Exception:
+    pass
+  return "127.0.0.1:7555"
+
+
 DEFAULT_OUT = REPO_ROOT / "autopilot" / "captures"
 
 
 def connect(device_id: str):
   adb.connect(device_id)
   device = adb.device(device_id)
+  screen, complaint = display.pin(device)
+  if complaint:
+    print(f"[WARN] {complaint}")
+  print(f"[OK] Capturing {screen}")
   return device
 
 
 def grab(device) -> np.ndarray:
   """Identical to utils/adb_actions.screenshot() minus the region crop: RGB uint8."""
-  try:
-    img = device.screenshot(error_ok=False)
-  except Exception:
-    img = device.screenshot()
-  return np.array(img)
+  return np.array(display.screenshot(device))
 
 
 def fingerprint(frame: np.ndarray, scale: int = 4) -> np.ndarray:
@@ -82,7 +116,9 @@ def save_frame(frame: np.ndarray, path: Path) -> None:
 
 def main() -> int:
   p = argparse.ArgumentParser(description="Capture Umamusume frames over ADB for template building.")
-  p.add_argument("--device", default="127.0.0.1:5555", help="ADB device id (default: %(default)s)")
+  p.add_argument("--device", default=default_device(),
+                 help="ADB device id (default: the Device ID from Set-Up, "
+                      "currently %(default)s)")
   p.add_argument("--session", default=None, help="Session name; defaults to a timestamp")
   p.add_argument("--out", default=str(DEFAULT_OUT), help="Output root (default: autopilot/captures)")
   p.add_argument("--poll", type=float, default=1.0, help="Seconds between polls (default: %(default)s)")

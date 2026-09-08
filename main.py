@@ -1,4 +1,6 @@
 import sys
+import atexit
+import signal
 import subprocess
 import warnings
 warnings.filterwarnings(
@@ -62,6 +64,7 @@ import core.bot as bot
 from server.main import app
 from update_config import update_config
 from utils.notifications import on_started
+from utils.win_job import kill_child_when_we_exit
 
 bot.windows_window = None
 
@@ -156,25 +159,94 @@ def hotkey_listener():
       bot.is_bot_running = False
     sleep(0.5)
 
+# The running multi-client fleet, and the job object holding it to this
+# process's lifetime. Module level so the atexit hook can reach them.
+_fleet = None
+_fleet_job = None
+
+
+def stop_fleet_on_exit():
+  """Ask the fleet to wind down when the server exits for any reason.
+
+  The job object would kill it regardless, but that is a kernel-level
+  execution and gives the clients no chance to finish the tap they are in the
+  middle of. Trying the polite route first costs a few seconds.
+  """
+  global _fleet
+  if _fleet is not None and _fleet.poll() is None:
+    print("[AUTOPILOT] Server exiting - stopping the clients.")
+    stop_fleet(_fleet)
+    _fleet = None
+
+
+def stop_fleet(fleet):
+  """Stop a multi-client autopilot and everything it started.
+
+  terminate() would kill only the supervisor and leave its workers tapping
+  away at the emulators with nothing left to stop them. Ctrl+Break reaches the
+  whole process group, and Python turns it into the KeyboardInterrupt both the
+  supervisor and each worker already shut down cleanly on.
+  """
+  if fleet is None or fleet.poll() is not None:
+    return
+  try:
+    fleet.send_signal(signal.CTRL_BREAK_EVENT)
+    fleet.wait(timeout=30)
+    return
+  except Exception as e:
+    warning(f"Could not stop the autopilot clients gracefully ({e}); killing them.")
+  # Last resort: take down the tree by pid, since the group signal did not land.
+  subprocess.run(["taskkill", "/F", "/T", "/PID", str(fleet.pid)],
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
 def autopilot_listener():
+  global _fleet, _fleet_job
   # Shares bot.is_bot_running with the F1 bot, so only one runs at a time.
   from autopilot.loop import run as run_autopilot
+  from autopilot import config as auto_config
   worker = None
+  fleet = None
   while True:
     keyboard.wait(bot.autopilot_hotkey)
+    running = (worker is not None and worker.is_alive()) or (fleet is not None and fleet.poll() is None)
     # Clearing the flag does not stop the thread instantly, so track the thread
     # itself. Going by the flag alone starts a second autopilot whenever the
     # key is pressed again while the previous one is still winding down.
-    if worker is not None and worker.is_alive():
+    if running:
       print("[AUTOPILOT] Stopping...")
       bot.is_bot_running = False
+      stop_fleet(fleet)
+      fleet = None
+      _fleet = None
     elif bot.is_bot_running:
       print(f"[AUTOPILOT] The bot is running. Press '{bot.hotkey}' to stop it first.")
     else:
-      print("[AUTOPILOT] Starting...")
-      bot.is_bot_running = True
-      worker = threading.Thread(target=run_autopilot, daemon=True)
-      worker.start()
+      devices = auto_config.resolve_devices()
+      if len(devices) > 1:
+        # Several clients means several processes, and spawning those from a
+        # thread of a server that has already imported uvicorn, pygame and
+        # torch is asking for trouble. A plain child process running the
+        # standalone entry point keeps the web UI out of it entirely.
+        print(f"[AUTOPILOT] Starting {len(devices)} clients: {', '.join(devices)}")
+        print(f"[AUTOPILOT] Their output goes to logs/<port>/. Press "
+              f"'{bot.autopilot_hotkey}' again to stop them.")
+        # Its own process group, so a stop can send it Ctrl+Break without
+        # also stopping this server. That does mean console Ctrl+C no longer
+        # reaches it, which is what the job object below is for: it ties the
+        # fleet's life to ours so no route out of here can leave the clients
+        # running, and orphaned bots keep tapping the game for ever.
+        fleet = subprocess.Popen([sys.executable, "autopilot_run.py"],
+                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        _fleet = fleet
+        _fleet_job = kill_child_when_we_exit(fleet)
+        if _fleet_job is None:
+          warning("Could not tie the clients to this process; if this window is "
+                  "killed rather than stopped, stop them with F10 or Task Manager.")
+      else:
+        print("[AUTOPILOT] Starting...")
+        bot.is_bot_running = True
+        worker = threading.Thread(target=run_autopilot, daemon=True)
+        worker.start()
     sleep(0.5)
 
 def is_port_available(host, port):
@@ -211,6 +283,7 @@ def start_server():
   server.run()
 
 if __name__ == "__main__":
+  atexit.register(stop_fleet_on_exit)
   update_config()
   config.reload_config()
   start_server()

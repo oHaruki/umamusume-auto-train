@@ -37,6 +37,19 @@ class Screen:
 
 
 SCREENS: tuple[Screen, ...] = (
+  # --- topping up TP ---------------------------------------------------
+  # One rule covers all three steps of the Recover TP flow - the item list,
+  # the amount dialog stacked on top of it, and the "Used 10 Carats" receipt -
+  # because the same green header sits on all three and cropping three
+  # lookalike headers apart would be a coin toss. The handler tells them apart
+  # by what is on the dialog instead, which is unambiguous.
+  #
+  # Ranked first, above "training_log": the amount dialog's OK button IS
+  # ok_btn.png, so the training-log rule would otherwise claim this screen and
+  # confirm the purchase before the amount had been set.
+  Screen("recover_tp", f"{AUTO}/recover_tp_header.png",
+         "spend carats on TP", handler="recover_tp"),
+
   # --- start of a run -------------------------------------------------
   Screen("borrow_card", f"{AUTO}/borrow_card_header.png",
          "find and tap the wanted support card", handler="borrow"),
@@ -77,7 +90,7 @@ SCREENS: tuple[Screen, ...] = (
          "load the agenda if wanted, then spend TP and begin training",
          handler="final_confirmation"),
   Screen("home", f"{AUTO}/career_btn.png",
-         "open Career", click=f"{AUTO}/career_btn.png"),
+         "top up TP if it is low, else open Career", handler="home"),
 
   # --- end of a run ---------------------------------------------------
   Screen("training_log", f"{BTN}/ok_btn.png",
@@ -148,6 +161,30 @@ LOAD_LIST_BUTTON = f"{AUTO}/load_list_btn.png"
 TP_EVENT_BUTTON = f"{AUTO}/tp_event.png"
 NEXT_BUTTON = f"{AUTO}/next_btn_below_ribbon.png"
 
+CAREER_BUTTON = f"{AUTO}/career_btn.png"
+
+# --- Recover TP ------------------------------------------------------
+# Home -> the + beside the TP bar -> item list -> Use on the Carats row ->
+# amount dialog -> + -> OK -> receipt -> Close -> back Home.
+#
+# Templates the handler needs. Missing ones disable the feature with one
+# warning rather than crashing: cv2.imread() returns None for a file that is
+# not there and match_template() would then fail on .shape.
+RECOVER_TP_HEADER = f"{AUTO}/recover_tp_header.png"
+# The "Use" button repeated once per row of the item list.
+TP_USE_BUTTON = f"{AUTO}/tp_use_btn.png"
+# The Carats thumbnail, used to pick which row's Use to press. Without it the
+# handler refuses to press anything rather than spending an unknown item.
+TP_CARATS_ITEM = f"{AUTO}/tp_carats_item.png"
+# The round + that raises the amount on the confirmation dialog.
+TP_AMOUNT_PLUS = f"{AUTO}/tp_amount_plus_btn.png"
+
+TP_TEMPLATES = (RECOVER_TP_HEADER, TP_USE_BUTTON, TP_CARATS_ITEM, TP_AMOUNT_PLUS)
+
+# A Use button and the Carats thumbnail count as the same row when their
+# centres are within this many pixels vertically. Rows are ~87px apart.
+TP_ROW_TOLERANCE = 45
+
 MATCH_THRESHOLD = 0.85
 
 # --- geometry, in ADB frame coordinates (800x1080) --------------------
@@ -168,6 +205,16 @@ BORROW_RELOAD_BUTTON = f"{AUTO}/borrow_refresh_btn.png"
 # Badge marking a borrow row whose card is already in the deck. Drawn over the
 # thumbnail, left of the OCR'd text column, so it has to be matched as an image.
 DUPLICATE_BADGE = f"{AUTO}/duplicate_support_badge.png"
+
+# Home's TP counter, reading "92/100", and the green + beside it. Fixed
+# positions rather than a template match: all three + buttons in the top bar
+# (TP, RP, carats) are the same image, so a match could pick any of them.
+# Measured off a real 800x1080 Home frame. The left edge sits in the gap
+# between the regen timer ("00:13", ending around x=306) and the counter, so a
+# three-digit TP - which a refill produces, 113/100 - has room to grow into it
+# without the timer's own digits being read as part of the total.
+HOME_TP_TEXT_LTRB = (314, 28, 406, 50)
+HOME_TP_PLUS_POS = (418, 50)
 
 # Skill point total on the Learn screen, right of the "Skill Points" bar.
 # Verified reading 3258 off a real frame.

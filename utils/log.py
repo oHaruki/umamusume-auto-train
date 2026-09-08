@@ -10,6 +10,32 @@ import time
 import shutil
 import threading
 from logging.handlers import RotatingFileHandler
+
+
+_rotate_complaint_shown = False
+
+
+class TolerantRotatingFileHandler(RotatingFileHandler):
+  """A rotating handler that keeps logging when it cannot rename the file.
+
+  On Windows os.rename fails with WinError 32 while any other process holds
+  the log open, which happens when a client is started again before the
+  previous one has exited. The stock handler then turns every single record
+  from that point on into a full traceback on stderr - thousands of them -
+  while the log itself stops rotating anyway. Carrying on with an oversized
+  file is much cheaper than that, and it heals itself as soon as the other
+  process goes away.
+  """
+
+  def rotate(self, source, dest):
+    global _rotate_complaint_shown
+    try:
+      super().rotate(source, dest)
+    except OSError as e:
+      if not _rotate_complaint_shown:
+        _rotate_complaint_shown = True
+        print(f"[WARN] Could not rotate {source}: {e}. Still logging to it; this "
+              "usually means the same client is running twice.")
 import atexit
 import cv2
 import numpy as np
@@ -24,6 +50,11 @@ print(f"[DEBUG] Bot version: {VERSION}")
 
 log_dir = None
 log_level = None
+# Where debug_window() drops frames, and a tag prepended to every log line.
+# Both are set by init_logging(); the defaults keep a single-client run's
+# output exactly as it was.
+images_dir = os.path.join(os.getcwd(), "logs", "images")
+line_prefix = None
 parser = argparse.ArgumentParser()
 parser.add_argument('--debug', nargs='?', const=0, type=int, default=None, 
                     help='Enable debug logging with optional level (default: 0)')
@@ -170,10 +201,7 @@ def debug_window(screen, wait_timer=0, x=-1400, y=-100, save_name=None, show_on_
     global debug_image_counter
     base_name = save_name.rsplit('.', 1)[0]  # Remove extension if present
     debug(f"Saving debug image: {debug_image_counter}_{base_name}.png")
-    if bot.hotkey == "f1":
-      cv2.imwrite(f"logs/images/{debug_image_counter}_{base_name}.png", screen)
-    else:
-      cv2.imwrite(f"logs/{bot.hotkey}/images/{debug_image_counter}_{base_name}.png", screen)
+    cv2.imwrite(os.path.join(images_dir, f"{debug_image_counter}_{base_name}.png"), screen)
     debug_image_counter += 1
 
   if show_on_screen:
@@ -342,23 +370,40 @@ def record_turn(state, last_state, action):
   rotate_log(os.path.join(log_dir, "actions_taken.txt"))
   rotate_log(os.path.join(log_dir, "year_changes.txt"))
 
-def init_logging():
-  global log_level, log_dir
+def init_logging(subdir=None, prefix=None):
+  """Point logging at logs/ (or logs/<subdir>), optionally tagging each line.
 
-  if bot.hotkey == "f1":
-    log_dir = os.path.join(os.getcwd(), "logs")
-  else:
-    log_dir = os.path.join(os.getcwd(), "logs", bot.hotkey)
+  `subdir` and `prefix` exist for the multi-device autopilot: every client runs
+  in its own process, and without them all of them write the same log.txt and
+  print console lines that cannot be told apart.
+  """
+  global log_level, log_dir, images_dir, line_prefix
+
+  if subdir is None:
+    subdir = None if bot.hotkey == "f1" else bot.hotkey
+  if prefix is not None:
+    line_prefix = prefix
+
+  log_dir = os.path.join(os.getcwd(), "logs", subdir) if subdir else os.path.join(os.getcwd(), "logs")
+  images_dir = os.path.join(log_dir, "images")
   os.makedirs(log_dir, exist_ok=True)
 
   root = logging.getLogger()
   root.setLevel(logging.DEBUG)  # allow everything internally
 
-  # Remove any existing handlers (important if re-run)
+  # Remove any existing handlers (important if re-run). Closing them matters
+  # as much as removing them: a handler that is merely detached still holds
+  # its file open, and on Windows that open handle blocks the next rollover
+  # for the life of the process.
   for h in root.handlers[:]:
     root.removeHandler(h)
+    try:
+      h.close()
+    except Exception:
+      pass
 
-  formatter = logging.Formatter("[%(levelname)s] %(message)s")
+  tag = f"[{line_prefix}] " if line_prefix else ""
+  formatter = logging.Formatter(f"[%(levelname)s] {tag}%(message)s")
 
   # ---------------------------
   # Console handler (respects CLI level)
@@ -368,29 +413,25 @@ def init_logging():
   console_handler.setFormatter(formatter)
   root.addHandler(console_handler)
 
-  handler = RotatingFileHandler(
+  handler = TolerantRotatingFileHandler(
     os.path.join(log_dir, "log.txt"),
     maxBytes=2_000_000,
     backupCount=5,
     encoding="utf-8"
   )
 
-  handler.setFormatter(
-    logging.Formatter("[%(levelname)s] %(message)s")
-  )
+  handler.setFormatter(formatter)
   handler.setLevel(log_level)
 
   logging.getLogger().addHandler(handler)
 
-  debug_handler = RotatingFileHandler(
+  debug_handler = TolerantRotatingFileHandler(
     os.path.join(log_dir, "log_debug.txt"),
     maxBytes=5_000_000,
     backupCount=5,
     encoding="utf-8"
   )
-  debug_handler.setFormatter(
-    logging.Formatter("[%(levelname)s] %(message)s")
-  )
+  debug_handler.setFormatter(formatter)
   debug_handler.setLevel(logging.DEBUG)
   logging.getLogger().addHandler(debug_handler)
 
@@ -398,7 +439,4 @@ def init_logging():
   logging.getLogger('PIL').setLevel(logging.WARNING)
 
   # delete images folder
-  if bot.hotkey == "f1":
-    rotate_and_delete(os.path.join(os.getcwd(), "logs", "images"))
-  else:
-    rotate_and_delete(os.path.join(os.getcwd(), "logs", bot.hotkey, "images"))
+  rotate_and_delete(images_dir)
