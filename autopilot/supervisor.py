@@ -44,6 +44,23 @@ STOP_POLL = 0.25
 MAX_RESTARTS = 5
 RESTART_BACKOFF = 30.0
 
+# A client that stayed up this long before dying was not in a crash loop, so
+# its restart budget starts over. Without this, five unrelated hiccups spread
+# across a night used up the budget and left the client stopped for the rest
+# of it.
+HEALTHY_RUN = 15 * 60.0
+
+# A client whose device has not answered, and which has not deliberately
+# waited, for this long is frozen rather than slow. Every ADB command is
+# bounded well inside this, so nothing legitimate gets near it.
+WATCHDOG_TIMEOUT = 300.0
+
+# How a client's process ends, as the supervisor reads it.
+EXIT_FINISHED = 0     # done on purpose: stop hotkey, run limit, borrow gave up
+EXIT_CRASHED = 1      # kept failing; a fresh process may do better
+EXIT_NO_RESTART = 2   # cannot run as configured; restarting would only repeat it
+EXIT_FROZEN = 3       # the watchdog ended it; worth a restart like any crash
+
 
 def new_stop_flag(ctx=None):
   """A one-way "everybody stop" flag that is safe to share with the workers.
@@ -75,13 +92,43 @@ def claim_device(label: str):
 
   Returns the handle to keep alive, or None if another process holds it.
   """
-  lock_dir = os.path.join(REPO_ROOT, "logs", label)
-  os.makedirs(lock_dir, exist_ok=True)
-  path = os.path.join(lock_dir, "client.lock")
+  return _lock(os.path.join(REPO_ROOT, "logs", label, "client.lock"))
+
+
+def claim_emulator(identity: str, serial: str):
+  """Lock one emulator by its Android id. Returns (handle, holder).
+
+  claim_device() locks a port, and two ports can reach one emulator - MuMu's
+  7555 alias forwards to one of the real instance ports. Locking the machine
+  behind the port is what actually keeps two bots off one screen. `holder` is
+  the serial of whoever has it when the lock is refused, for the error.
+  """
+  lock_dir = os.path.join(REPO_ROOT, "logs", ".emulators")
+  name = re.sub(r"[^A-Za-z0-9_-]", "_", identity)
+  owner = os.path.join(lock_dir, f"{name}.owner")
+  handle = _lock(os.path.join(lock_dir, f"{name}.lock"))
+  if handle is None:
+    try:
+      with open(owner, "r", encoding="utf-8") as f:
+        return None, f.read().strip() or "another client"
+    except OSError:
+      return None, "another client"
+  try:
+    with open(owner, "w", encoding="utf-8") as f:
+      f.write(serial)
+  except OSError:
+    pass
+  return handle, None
+
+
+def _lock(path: str):
+  os.makedirs(os.path.dirname(path), exist_ok=True)
   try:
     handle = open(path, "w")
   except OSError:
-    return None            # cannot lock; better to run than to refuse
+    # Opening for write truncates, which Windows refuses while another
+    # process holds a lock on the file - so this is a held lock too.
+    return None
   try:
     if os.name == "nt":
       import msvcrt
@@ -112,26 +159,38 @@ def _worker(device_id: str, label: str, stop_event) -> None:
     sys.path.insert(0, REPO_ROOT)
 
   import core.bot as bot
-  from utils.log import info, init_logging
+  from utils.log import error, info, init_logging
 
   bot.is_bot_running = True
+  bot.heartbeat = time.time()
   # Its own logs/<label>/ and its own tag on every console line, so two
   # clients writing to the same terminal stay tellable apart.
   init_logging(subdir=label, prefix=label)
 
+  main_thread = threading.main_thread()
 
-  def watch_stop() -> None:
+  def watch() -> None:
     while bot.is_bot_running:
       if stop_event.value:
         info("Stop requested, winding down.")
         bot.is_bot_running = False
         return
+      silent = time.time() - bot.heartbeat
+      if silent > WATCHDOG_TIMEOUT:
+        # Where it is stuck is the one thing that makes the next freeze
+        # fixable, and it is lost the moment the process goes.
+        import traceback
+        frame = sys._current_frames().get(main_thread.ident)
+        where = "".join(traceback.format_stack(frame)) if frame else "(no frame)"
+        error(f"No response for {silent:.0f}s - this client has frozen. Restarting it. "
+              f"It was stuck here:\n{where}")
+        os._exit(EXIT_FROZEN)
       time.sleep(STOP_POLL)
 
-  threading.Thread(target=watch_stop, daemon=True).start()
+  threading.Thread(target=watch, daemon=True).start()
 
   from autopilot.loop import run
-  run(device_id=device_id)
+  sys.exit(run(device_id=device_id) or EXIT_FINISHED)
 
 
 def run_devices(device_ids: list[str], stop_event=None) -> None:
@@ -158,10 +217,13 @@ def run_devices(device_ids: list[str], stop_event=None) -> None:
   ctx = mp.get_context("spawn")
   stop = stop_event if stop_event is not None else new_stop_flag(ctx)
 
+  started_at = {}
+
   def spawn(device_id: str, label: str):
     process = ctx.Process(target=_worker, args=(device_id, label, stop),
                           name=f"autopilot-{label}", daemon=False)
     process.start()
+    started_at[label] = time.time()
     return process
 
   # [label, device_id, process]. A list, not the tuple it once was: a restart
@@ -195,12 +257,24 @@ def run_devices(device_ids: list[str], stop_event=None) -> None:
 
         # Exit 0 is the client deciding it was finished - a run limit reached,
         # or the stop hotkey. Only a crash is worth starting again.
-        if process.exitcode == 0:
+        if process.exitcode == EXIT_FINISHED:
           if label not in reported:
             reported.add(label)
             print(f"[AUTOPILOT] {label}: finished on its own. "
                   f"See logs/{label}/log.txt.")
           continue
+
+        # A setup problem - another client already on that emulator, a port
+        # that wanders between instances - would fail identically every time.
+        if process.exitcode == EXIT_NO_RESTART:
+          if label not in reported:
+            reported.add(label)
+            print(f"[AUTOPILOT] {label}: cannot run as configured, not restarting it. "
+                  f"The reason is at the end of logs/{label}/log.txt.")
+          continue
+
+        if label not in retry_at and time.time() - started_at.get(label, 0) >= HEALTHY_RUN:
+          restarts[label] = 0
 
         if restarts.get(label, 0) >= MAX_RESTARTS:
           if label not in reported:
@@ -214,7 +288,8 @@ def run_devices(device_ids: list[str], stop_event=None) -> None:
         # it here, so an emulator still coming back up is given a moment.
         if label not in retry_at:
           retry_at[label] = time.time() + RESTART_BACKOFF
-          print(f"[AUTOPILOT] {label}: died (exit {process.exitcode}), restarting in "
+          why = "froze" if process.exitcode == EXIT_FROZEN else f"died (exit {process.exitcode})"
+          print(f"[AUTOPILOT] {label}: {why}, restarting in "
                 f"{RESTART_BACKOFF:.0f}s "
                 f"(attempt {restarts.get(label, 0) + 1} of {MAX_RESTARTS}). "
                 f"See logs/{label}/log.txt.")

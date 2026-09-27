@@ -1,3 +1,5 @@
+import time
+
 from adbutils import adb
 import numpy as np
 import core.bot as bot
@@ -10,9 +12,10 @@ def init_adb():
   global device
   if bot.use_adb:
     try:
-      adb.connect(bot.device_id)
+      adb.connect(bot.device_id, timeout=display.RECONNECT_TIMEOUT)
       device = adb.device(bot.device_id)
       screen, complaint = display.pin(device)
+      display.remember(device)
     except Exception as e:
       error(f"Failed to initialize ADB: {e}")
       return False
@@ -24,12 +27,16 @@ def init_adb():
 def click(x, y):
   if device is None:
     return False
-  return display.tap(device, x, y)
+  result = display.tap(device, x, y)
+  bot.heartbeat = time.time()
+  return result
 
 def swipe(x1, y1, x2, y2, duration=0.3):
   if device is None:
     return False
-  return display.swipe(device, x1, y1, x2, y2, duration)
+  result = display.swipe(device, x1, y1, x2, y2, duration)
+  bot.heartbeat = time.time()
+  return result
 
 def text(content):
   if device is None:
@@ -79,6 +86,7 @@ def screenshot(region_xywh: tuple[int, int, int, int] = None, force_save=False):
     # instead of reporting that capture broke.
     screenshot = np.array(display.screenshot(device))
     cached_screenshot = screenshot
+    bot.heartbeat = time.time()
   if force_save:
     debug_window(screenshot, save_name="adb_screenshot", force_save=force_save)
   if args.device_debug:

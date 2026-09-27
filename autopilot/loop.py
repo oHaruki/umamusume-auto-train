@@ -15,13 +15,18 @@ from __future__ import annotations
 import os
 import re
 import time
+import traceback
 
+import cv2
 from PIL import Image
 
 import core.bot as bot
 import core.config as core_config
+import utils.adb_actions as adb_actions
 import utils.constants as constants
 import utils.device_action_wrapper as device_action
+import utils.display as display
+import utils.log as log_state
 from core.ocr import extract_allowed_text, extract_number, get_reader
 from core.recognizer import compare_brightness
 from core.skill import buy_skill, init_skill_py
@@ -34,6 +39,7 @@ from utils.tools import sleep
 
 from autopilot import config as auto_config
 from autopilot.borrow_match import duplicate_row_indexes, find_best, parse_rows
+from autopilot.emulators import alias_problem
 from autopilot.screens import (
   BORROW_ALLOWLIST, BORROW_LIST_LTRB, BORROW_ROW_X, BORROW_SCROLL_FROM,
   BORROW_RELOAD_BUTTON, BORROW_SCROLL_TO, CAREER_BUTTON, DUPLICATE_BADGE,
@@ -65,6 +71,28 @@ MAX_LEFTOVER_PASSES = 15
 # which is only the level below which the bot tops up: at 20 TP there is no
 # need to buy anything and no reason to wait either, the run can just start.
 RUN_TP_COST = 15
+
+# How long a client keeps trying to reach its emulator before giving up and
+# letting the supervisor decide whether to start it again.
+CONNECT_GIVE_UP = 10 * 60.0
+
+# Consecutive ticks that may fail - a dropped connection, a garbled frame -
+# before the client gives up. Spaced out by a growing wait, this is well over
+# ten minutes of the device not recovering.
+MAX_STEP_FAILURES = 20
+
+# Acting on one screen this many times in a row without it changing starts a
+# re-check of which display the game is on, repeated every REPIN_EVERY after.
+# On MuMu's Android 15 image the game gets a virtual display of its own, and if
+# that is replaced the old one can keep handing back its last frame - the bot
+# then taps a screen that is not there any more, indefinitely.
+REPIN_AFTER = 10
+REPIN_EVERY = 30
+
+# Past this many actions on one unchanging screen, nothing is going to change
+# it: save what is on screen for diagnosis and stop instead of tapping for
+# hours. At roughly two seconds a tick this is about ten minutes.
+STUCK_LIMIT = 250
 
 
 class Autopilot:
@@ -217,6 +245,12 @@ class Autopilot:
             f"{timeout}s; reading it anyway, the tap may be off.")
     return False
 
+  def borrow_list_unmoved(self, read_from) -> bool:
+    """Whether the borrow list is still exactly where it was when read."""
+    device_action.flush_screenshot_cache()
+    now = device_action.screenshot(region_ltrb=BORROW_LIST_LTRB)
+    return are_screenshots_same(read_from, now, diff_threshold=LIST_STILL_DIFF)
+
   def read_borrow_rows(self):
     crop = device_action.screenshot(region_ltrb=BORROW_LIST_LTRB)
     result = get_reader().readtext(crop, allowlist=BORROW_ALLOWLIST)
@@ -231,17 +265,28 @@ class Autopilot:
     current_tp = self.read_current_tp()
     info(f"Current TP is {current_tp} and cost is {tp_cost}")
     #continue if enough tp, otherwise wait or quit depending on config
-    if(current_tp>=tp_cost):
-      info("Enough TP, selecting scenario.")
-      device_action.locate_and_click(NEXT_BUTTON, confidence=MATCH_THRESHOLD)
-    else:
-      info("Not enough TP")
-      if self.cfg.wait_when_out_of_tp:
-        sleeptime = (tp_cost-current_tp-1)*10*60 + self.read_tp_refresh_time()
-        info(f"Waiting for {sleeptime} seconds ")
-        sleep(sleeptime)
+    # An unreadable counter (-1) is not a reading of zero. Treating it as one
+    # ended the whole client on a single OCR miss; the game refuses the run
+    # itself if TP really is short, so going ahead costs nothing.
+    if current_tp < 0 or current_tp >= tp_cost:
+      if current_tp < 0:
+        warning("Could not read TP on Scenario Select; going ahead.")
       else:
-        info("Wait for TP set to false, exiting")
+        info("Enough TP, selecting scenario.")
+      self.waiting_for_tp = False
+      if not device_action.locate_and_click(NEXT_BUTTON, confidence=MATCH_THRESHOLD):
+        warning("Next not found on Scenario Select.")
+    else:
+      if self.cfg.wait_when_out_of_tp:
+        # Polled from the loop rather than slept here in one go: a sleep of
+        # hours inside a tick made the stop hotkey look dead for that long.
+        if not self.waiting_for_tp:
+          info(f"Not enough TP ({current_tp} of {tp_cost}); waiting for it to "
+               f"regenerate, about {(tp_cost - current_tp) * 10} minutes.")
+          self.waiting_for_tp = True
+        self.long_wait = True
+      else:
+        info("Not enough TP, and waiting for it is switched off. Stopping.")
         bot.is_bot_running = False
   
   def do_home(self, screen):
@@ -422,6 +467,7 @@ class Autopilot:
       # Must settle before reading: row positions are only valid if the list
       # is where it will still be when the tap lands.
       self.wait_for_borrow_list_still()
+      read_from = device_action.screenshot(region_ltrb=BORROW_LIST_LTRB)
       rows = self.read_borrow_rows()
       debug(f"Borrow list page {attempt + 1}: {[r.card for r in rows]}")
 
@@ -432,6 +478,12 @@ class Autopilot:
       usable = [row for index, row in enumerate(rows) if index not in duplicates]
 
       row, target, score = find_best(usable, targets, self.cfg.borrow_match_threshold)
+      if row and not self.borrow_list_unmoved(read_from):
+        # The settle check can time out, and OCR takes long enough for a list
+        # still gliding to move a whole row. Tapping now would take whichever
+        # card slid under the position, so look again instead.
+        warning("The borrow list moved while it was being read; reading it again.")
+        continue
       if row:
         info(f"Borrowing {target!r} - matched {row.card!r} ({score:.3f}) from {row.friend!r}.")
         device_action.click((BORROW_ROW_X, row.center_y))
@@ -581,6 +633,33 @@ class Autopilot:
     device_action.locate_and_click("assets/buttons/back_btn.png",
                                    region_ltrb=constants.SCREEN_BOTTOM_BBOX)
 
+  # --- getting unstuck ------------------------------------------------
+  def repin(self) -> None:
+    """Look up which display the game is on again, and read and tap that one."""
+    before = display.get(adb_actions.device)
+    after, complaint = display.pin(adb_actions.device)
+    device_action.flush_screenshot_cache()
+    if str(after) != str(before):
+      warning(f"The game moved from {before} to {after}; following it.")
+    else:
+      info(f"Re-checked the display: still {after}.")
+    if complaint:
+      warning(complaint)
+
+  def give_up_stuck(self, screen) -> None:
+    """Save the screen that would not change, then stop this client."""
+    path = os.path.join(log_state.log_dir, f"stuck_{screen.name}.png")
+    try:
+      device_action.flush_screenshot_cache()
+      frame = device_action.screenshot()
+      cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+      saved = f" What was on screen is saved as {path}."
+    except Exception as e:
+      saved = f" (Could not save the screen: {e}.)"
+    error(f"Acted on {screen.name} {self.repeat_count} times without it changing. "
+          f"Stopping rather than tapping it for hours.{saved}")
+    device_action.stop_bot(StopReason.STUCK)
+
   # --- one tick -------------------------------------------------------
   def step(self) -> str:
     """Act once. Returns "acted", "settling" or "idle"."""
@@ -619,6 +698,11 @@ class Autopilot:
       if self.repeat_count % 5 == 0:
         warning(f"Still on {screen.name} after {self.repeat_count} actions - "
                 "the click may not be registering.")
+      if self.repeat_count >= STUCK_LIMIT:
+        self.give_up_stuck(screen)
+      if (self.repeat_count >= REPIN_AFTER
+          and (self.repeat_count - REPIN_AFTER) % REPIN_EVERY == 0):
+        self.repin()
 
     # A career's skill budget resets when its results first appear.
     if screen.name == "training_log":
@@ -649,13 +733,61 @@ class Autopilot:
     return "acted"
 
 
-def run(device_id: str | None = None) -> None:
+def rest(seconds: float) -> None:
+  """Sleep in slices so a stop request is noticed promptly.
+
+  The long training poll is 20s; sleeping it in one go means the hotkey
+  appears dead for that long after being pressed. Waiting on purpose also
+  counts as alive, so the worker's watchdog leaves it alone.
+  """
+  end = time.time() + seconds
+  while bot.is_bot_running:
+    bot.heartbeat = time.time()
+    remaining = end - time.time()
+    if remaining <= 0:
+      return
+    sleep(min(0.5, remaining))
+
+
+def connect_with_retry() -> bool:
+  """init_adb(), retried with backoff. False if stopped or it never came up.
+
+  An emulator that is restarting, or a MuMu port that has dropped for a
+  moment, answers "device offline" for a while and then comes back. Giving up
+  on the first refusal ended the client for the night: it exited cleanly, so
+  the supervisor took it for finished and never started it again.
+  """
+  wait = 5.0
+  give_up_at = time.time() + CONNECT_GIVE_UP
+  while bot.is_bot_running:
+    if init_adb():
+      return True
+    if time.time() >= give_up_at:
+      error(f"{bot.device_id} has not answered for {CONNECT_GIVE_UP / 60:.0f} minutes. "
+            "Is the emulator running, with ADB on and that port?")
+      return False
+    warning(f"Could not reach {bot.device_id}; trying again in {wait:.0f}s.")
+    rest(wait)
+    wait = min(wait * 2, 60.0)
+  return False
+
+
+def run(device_id: str | None = None) -> int:
   """Drive one client. `device_id` overrides the one in config.json.
 
   Every client the supervisor starts gets its own process, so the module-level
   state this reaches through - the ADB handle, the screenshot cache, the OCR
   reader, bot.is_bot_running - belongs to that client alone.
+
+  Returns one of the supervisor's EXIT_* codes, which tells it whether a
+  restart could help.
   """
+  # Imported late: the supervisor imports this module.
+  from autopilot.supervisor import (
+    EXIT_CRASHED, EXIT_FINISHED, EXIT_NO_RESTART, claim_device, claim_emulator,
+    label_for,
+  )
+
   # Per-client settings laid over the shared ones, so two clients can differ
   # in the card they borrow while sharing everything else.
   cfg = auto_config.load_for(device_id)
@@ -669,72 +801,105 @@ def run(device_id: str | None = None) -> None:
   if not bot.use_adb:
     error("Autopilot supports ADB only. Set use_adb in config.json.")
     bot.is_bot_running = False
-    return
+    return EXIT_NO_RESTART
 
-  # One bot per emulator. Restarting the fleet before the previous one has
-  # finished exiting would otherwise put two on the same screen, each undoing
-  # the other's taps - and the first sign of it is the log files failing to
-  # rotate, which is a long way from the cause. Claimed here rather than in
-  # the supervisor so the single-client and standalone paths are covered too.
-  # Imported late: the supervisor imports this module.
-  from autopilot.supervisor import claim_device, label_for
-  device_lock = claim_device(label_for(bot.device_id))
-  if device_lock is None:
-    error(f"Another autopilot is already driving {bot.device_id}. Not starting a "
-          "second one - two bots on one emulator undo each other's taps. Stop "
-          "the first one and try again.")
+  # Before touching the device at all: a port that wanders between emulators
+  # cannot be made safe by anything done after connecting to it.
+  problem = alias_problem(bot.device_id)
+  if problem:
+    error(f"{problem} Not starting this client.")
     bot.is_bot_running = False
-    return
+    return EXIT_NO_RESTART
 
-  # Same shift main.py applies for ADB, which puts GAME_WINDOW_BBOX at
-  # (0,0,800,1080) and lines the constants up with the emulator frame.
-  constants.adjust_constants_x_coords(offset=-155)
-  if not init_adb():
-    error("Could not reach the device over ADB.")
-    # Cleared on every exit path, not just the loop's own: a worker's stop
-    # watcher waits on this flag, and leaving it raised keeps that thread
-    # spinning after there is nothing left for it to watch. The lock goes the
-    # same way - a process that stays alive after a failed start must not keep
-    # holding the client.
-    bot.is_bot_running = False
-    try:
-      device_lock.close()
-    except Exception:
-      pass
-    return
-
-  pilot = Autopilot(cfg)
-  own = auto_config.load().device_overrides.get(bot.device_id) or {}
-  whose = "its own" if "borrow_card_targets" in own else "shared"
-  info(f"Autopilot started on {bot.device_id}. "
-       f"Borrow targets ({whose}): {cfg.borrow_card_targets or '(none configured)'}")
-  if own:
-    info(f"Settings this client overrides: {', '.join(sorted(own))}.")
-  if cfg.auto_recover_tp:
-    info(f"TP recovery on: below {cfg.tp_min} TP, Home spends carats "
-         f"({cfg.tp_recover_uses} press(es) of +) before starting a run.")
-
-  # A short unrecognised gap is a screen transition or a load, and resolves in
-  # seconds; a sustained one is the 50 minutes of training, where polling hard
-  # is pointless. Back off rather than paying the long wait at every transition.
-  BRIEF_IDLES = 5
-
-  def rest(seconds: float) -> None:
-    """Sleep in slices so a stop request is noticed promptly.
-
-    The long training poll is 20s; sleeping it in one go means the hotkey
-    appears dead for that long after being pressed.
-    """
-    end = time.time() + seconds
-    while bot.is_bot_running:
-      remaining = end - time.time()
-      if remaining <= 0:
-        return
-      sleep(min(0.5, remaining))
+  # Everything this run holds that must be let go of on the way out. Cleared on
+  # every exit path, not just the loop's own: the in-thread path outlives the
+  # run, and a lock left held would refuse the next start.
+  locks = []
+  pilot = None
 
   try:
+    # One bot per emulator. Restarting the fleet before the previous one has
+    # finished exiting would otherwise put two on the same screen, each undoing
+    # the other's taps. Claimed here rather than in the supervisor so the
+    # single-client and standalone paths are covered too.
+    device_lock = claim_device(label_for(bot.device_id))
+    if device_lock is None:
+      error(f"Another autopilot is already driving {bot.device_id}. Not starting a "
+            "second one - two bots on one emulator undo each other's taps. Stop "
+            "the first one and try again.")
+      return EXIT_NO_RESTART
+    locks.append(device_lock)
+
+    # Same shift main.py applies for ADB, which puts GAME_WINDOW_BBOX at
+    # (0,0,800,1080) and lines the constants up with the emulator frame.
+    constants.adjust_constants_x_coords(offset=-155)
+    if not connect_with_retry():
+      return EXIT_CRASHED if bot.is_bot_running else EXIT_FINISHED
+
+    # The port lock above cannot see two different ports reaching one
+    # emulator, which is the case that actually happens. This can.
+    emulator = display.expected.get(adb_actions.device.serial, "")
+    if emulator:
+      emulator_lock, holder = claim_emulator(emulator, bot.device_id)
+      if emulator_lock is None:
+        error(f"{bot.device_id} reaches the same emulator {holder} is already "
+              f"driving (Android id {emulator}). Two ports lead to one emulator - "
+              "list each emulator once, by its own port. Not starting this client.")
+        return EXIT_NO_RESTART
+      locks.append(emulator_lock)
+      info(f"Emulator {emulator}.")
+    else:
+      warning("Could not read this emulator's Android id, so a second client "
+              "reaching it through another port would go unnoticed.")
+
+    pilot = Autopilot(cfg)
+    own = auto_config.load().device_overrides.get(bot.device_id) or {}
+    whose = "its own" if "borrow_card_targets" in own else "shared"
+    info(f"Autopilot started on {bot.device_id}. "
+         f"Borrow targets ({whose}): {cfg.borrow_card_targets or '(none configured)'}")
+    if own:
+      info(f"Settings this client overrides: {', '.join(sorted(own))}.")
+    if cfg.auto_recover_tp:
+      info(f"TP recovery on: below {cfg.tp_min} TP, Home spends carats "
+           f"({cfg.tp_recover_uses} press(es) of +) before starting a run.")
+
+    # A short unrecognised gap is a screen transition or a load, and resolves in
+    # seconds; a sustained one is the 50 minutes of training, where polling hard
+    # is pointless. Back off rather than paying the long wait at every transition.
+    BRIEF_IDLES = 5
+
+    failures = 0
     while bot.is_bot_running:
-      status = pilot.step()
+      try:
+        status = pilot.step()
+        failures = 0
+      except (BotStopException, display.WrongDeviceError):
+        raise
+      except Exception as e:
+        # One bad tick used to take the whole client down, and with the reason
+        # printed only to the console it never reached the log either.
+        failures += 1
+        if failures > MAX_STEP_FAILURES:
+          error(f"Failed {MAX_STEP_FAILURES} times in a row, giving up: "
+                f"{type(e).__name__}: {e}")
+          debug(traceback.format_exc())
+          return EXIT_CRASHED
+        wait = min(5.0 * failures, 60.0)
+        error(f"{type(e).__name__}: {e} - trying again in {wait:.0f}s "
+              f"({failures} of {MAX_STEP_FAILURES}).")
+        debug(traceback.format_exc())
+        device_action.flush_screenshot_cache()
+        rest(wait)
+        if bot.is_bot_running and display.is_connection_error(e):
+          try:
+            if display.recover(adb_actions.device):
+              info(f"Reconnected to {bot.device_id}; now {display.get(adb_actions.device)}.")
+          except display.WrongDeviceError:
+            raise
+          except Exception as again:
+            debug(f"Reconnect failed: {again}")
+        continue
+
       if status == "acted":
         # A handler that has decided to wait out something slow - TP
         # regenerating - has no reason to be asked again a second later.
@@ -743,16 +908,22 @@ def run(device_id: str | None = None) -> None:
         rest(0.3)
       else:
         rest(1.0 if pilot.idle_streak <= BRIEF_IDLES else cfg.idle_poll_seconds)
+    return EXIT_FINISHED
   except BotStopException as e:
     info(f"{e}")
+    return EXIT_FINISHED
+  except display.WrongDeviceError as e:
+    error(f"{e}")
+    return EXIT_NO_RESTART
   except KeyboardInterrupt:
     info("Interrupted.")
+    return EXIT_FINISHED
   finally:
     bot.is_bot_running = False
-    # Matters for the in-thread path, where the process outlives the run and
-    # would otherwise refuse to start again.
-    try:
-      device_lock.close()
-    except Exception:
-      pass
-    info(f"Autopilot stopped after {pilot.runs_completed} completed run(s).")
+    for lock in locks:
+      try:
+        lock.close()
+      except Exception:
+        pass
+    if pilot is not None:
+      info(f"Autopilot stopped after {pilot.runs_completed} completed run(s).")

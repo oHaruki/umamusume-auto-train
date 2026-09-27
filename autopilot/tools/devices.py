@@ -1,10 +1,11 @@
 """List the emulators the autopilot could drive, and say which are usable.
 
 Every emulator instance listens on its own ADB port, and the defaults differ by
-product - MuMu's first two instances are usually 127.0.0.1:7555 and
-127.0.0.1:16416, BlueStacks uses 5555 and 5565 - so guessing a port is the
-usual reason a second client starts and immediately dies with "device not
-found".
+product - MuMu gives instance N port 16384 + 32N, BlueStacks uses 5555 and
+5565 - so guessing a port is the usual reason a second client starts and
+immediately dies with "device not found". MuMu's 7555 is an alias forwarded to
+whichever instance MuMu picks, so with several instances it is never the port
+to list.
 
 Two things this catches that a plain `adb devices` does not:
 
@@ -34,6 +35,7 @@ from adbutils import adb
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 from utils import display  # noqa: E402
+from autopilot.emulators import MUMU_ALIAS_PORT  # noqa: E402
 
 # Ports worth trying when nothing is connected yet. MuMu Player spaces its
 # instances 32 apart from 16384; the 75x5 pair and the BlueStacks 55x5 pair are
@@ -173,10 +175,13 @@ def main() -> int:
   print(f"\n{len(instances)} emulator instance(s):\n")
   usable = []
   for number, (_identity, group) in enumerate(instances.items(), 1):
-    # What config.json already uses wins, so a working setup is never renamed
-    # out from under you. Then the host:port form, which survives a restart
-    # where an emulator-NNNN serial may not, and finally the lowest port.
-    group.sort(key=lambda i: (i["serial"] not in configured,
+    # MuMu's 7555 alias loses to the instance's own port whatever else holds:
+    # it can be forwarded somewhere else after a reconnect. After that, what
+    # config.json already uses wins, so a working setup is never renamed out
+    # from under you. Then the host:port form, which survives a restart where
+    # an emulator-NNNN serial may not, and finally the lowest port.
+    group.sort(key=lambda i: (port_of(i["serial"]) == MUMU_ALIAS_PORT,
+                              i["serial"] not in configured,
                               not i["known"],
                               ":" not in i["serial"],
                               port_of(i["serial"])))

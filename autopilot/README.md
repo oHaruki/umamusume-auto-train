@@ -128,14 +128,26 @@ py -3.12 autopilot/tools/devices.py --scan
 It groups the serials that turn out to be the same emulator (one instance often answers
 to both a `127.0.0.1:PORT` and an `emulator-NNNN` form, and listing both would start two
 bots fighting over one screen), checks each is 800 x 1080 with the game open, and prints
-the line to paste. Ports differ by product: MuMu's first two instances are usually
-`127.0.0.1:7555` and `127.0.0.1:16416`, BlueStacks uses 5555 and 5565.
+the line to paste. Ports differ by product: MuMu gives each instance `16384 + 32 x index`
+(`127.0.0.1:16384`, `16416`, `16448`, ...), BlueStacks uses 5555 and 5565.
+
+**Never use MuMu's `127.0.0.1:7555` with more than one instance.** It is not an instance
+of its own but an alias MuMu forwards to whichever instance it picks, and it can pick a
+different one after a reconnect. A client on 7555 ends up on another client's emulator,
+playing the wrong account, and the two bots undo each other's taps. The autopilot
+refuses to start a client on 7555 while MuMu has several instances running, and says
+which ports to use instead. MuMu's own list is `MuMuManager.exe info -v all` in the
+`nx_main` or `shell` folder of its install.
 
 Then list them under **Clients** on the Autopilot tab, or pass them on the command line:
 
 ```
-py -3.12 autopilot_run.py --device 127.0.0.1:5555 --device 127.0.0.1:7555
+py -3.12 autopilot_run.py --device 127.0.0.1:16384 --device 127.0.0.1:16416
 ```
+
+Whatever ports are used, one emulator can only ever be driven by one client: each client
+locks the emulator by its Android id, so a second port that turns out to reach the same
+instance is refused rather than started.
 
 F2 and F10 start and stop the whole set. Each client gets a process of its own, its own
 `logs/<port>/` directory, and a `[port]` tag on every console line so two clients sharing
@@ -164,8 +176,8 @@ In `config.json` that is a client written as an object rather than a bare id:
 
 ```json
 "devices": [
-  "127.0.0.1:5555",
-  { "id": "127.0.0.1:7555", "borrow_card_targets": ["Kitasan Black"] }
+  "127.0.0.1:16384",
+  { "id": "127.0.0.1:16416", "borrow_card_targets": ["Kitasan Black"] }
 ]
 ```
 

@@ -404,6 +404,10 @@ def init_logging(subdir=None, prefix=None):
 
   tag = f"[{line_prefix}] " if line_prefix else ""
   formatter = logging.Formatter(f"[%(levelname)s] {tag}%(message)s")
+  # The files carry the time as well. Without it there is no telling how long
+  # a client sat on one screen, or lining up what two clients did at once.
+  file_formatter = logging.Formatter(f"%(asctime)s [%(levelname)s] {tag}%(message)s",
+                                     datefmt="%m-%d %H:%M:%S")
 
   # ---------------------------
   # Console handler (respects CLI level)
@@ -420,7 +424,7 @@ def init_logging(subdir=None, prefix=None):
     encoding="utf-8"
   )
 
-  handler.setFormatter(formatter)
+  handler.setFormatter(file_formatter)
   handler.setLevel(log_level)
 
   logging.getLogger().addHandler(handler)
@@ -431,7 +435,7 @@ def init_logging(subdir=None, prefix=None):
     backupCount=5,
     encoding="utf-8"
   )
-  debug_handler.setFormatter(formatter)
+  debug_handler.setFormatter(file_formatter)
   debug_handler.setLevel(logging.DEBUG)
   logging.getLogger().addHandler(debug_handler)
 

@@ -29,6 +29,18 @@ GAME_HINT = "umamusume"
 # How long to wait on the ADB server re-establishing a dropped connection.
 RECONNECT_TIMEOUT = 5.0
 
+# Upper bounds on a single shell command. adbutils defaults to 600 seconds, so
+# one screencap on a stalled transport froze a client for ten minutes, and the
+# re-pin after it - several more commands - for the better part of an hour,
+# with nothing in the log and the hotkey apparently dead. A healthy screencap
+# takes well under a second; anything near these limits is a broken connection
+# and is better reported as one, which the callers already recover from.
+CAPTURE_TIMEOUT = 15.0
+COMMAND_TIMEOUT = 10.0
+
+class WrongDeviceError(RuntimeError):
+  """A serial came back from a reconnect attached to a different emulator."""
+
 class Display:
   """The ids one Android screen answers to, and the commands aimed at it."""
 
@@ -40,14 +52,14 @@ class Display:
     cmd = ["screencap", "-p"]
     if self.physical:
       cmd += ["-d", self.physical]
-    img = Image.open(io.BytesIO(device.shell(cmd, encoding=None)))
+    img = Image.open(io.BytesIO(device.shell(cmd, encoding=None, timeout=CAPTURE_TIMEOUT)))
     return img.convert("RGB") if img.mode == "RGBA" else img
 
   def input(self, device, *params):
     cmd = ["input"]
     if self.logical is not None:
       cmd += ["-d", str(self.logical)]
-    return device.shell(cmd + [str(p) for p in params])
+    return device.shell(cmd + [str(p) for p in params], timeout=COMMAND_TIMEOUT)
 
   def __str__(self):
     return "the default display" if self.logical is None else f"display {self.logical}"
@@ -57,7 +69,8 @@ pinned = {}
 def focus_by_display(device):
   """[(logical id, focused window)] for every display, focused or not."""
   found = []
-  for block in re.split(r"(?=Display: mDisplayId=)", device.shell("dumpsys window displays")):
+  for block in re.split(r"(?=Display: mDisplayId=)",
+                        device.shell("dumpsys window displays", timeout=COMMAND_TIMEOUT)):
     header = re.match(r"Display: mDisplayId=(\d+)", block)
     if not header:
       continue
@@ -70,7 +83,7 @@ def physical_by_display(device):
   mapping = {}
   for logical, physical in re.findall(
       r"mDisplayId=(\d+)\s*\n\s*mPrimaryDisplayDevice=[^(\n]*\(local:(\d+)\)",
-      device.shell("dumpsys display")):
+      device.shell("dumpsys display", timeout=COMMAND_TIMEOUT)):
     mapping.setdefault(int(logical), physical)
   return mapping
 
@@ -119,6 +132,65 @@ def get(device):
   screen = pinned.get(device.serial)
   return screen if screen is not None else pin(device)[0]
 
+# The emulator each serial was attached to when its client started, by
+# identity(). A reconnect is checked against it.
+expected = {}
+
+def identity(device):
+  """This emulator's Android id, or "" if it cannot be read.
+
+  Ports are not a reliable name for an emulator. MuMu answers on 7555 as well
+  as on each instance's own port, and forwards 7555 to whichever instance it
+  picks, so a client pointed at 7555 has been seen driving the Android 12
+  instance one session and the Android 15 one - already driven by a second
+  client - the next. The Android id belongs to the instance itself.
+  """
+  try:
+    found = device.shell("settings get secure android_id", timeout=COMMAND_TIMEOUT).strip()
+  except Exception:
+    return ""
+  return "" if found in ("", "null") else found
+
+def remember(device):
+  """Record which emulator this serial is attached to. Returns its identity."""
+  expected[device.serial] = identity(device)
+  return expected[device.serial]
+
+def verify(device):
+  """Raise WrongDeviceError if the serial now reaches a different emulator.
+
+  An identity that cannot be read is let through: that is a connection still
+  settling, and the next command will fail on its own if it has not.
+  """
+  want = expected.get(device.serial)
+  if not want:
+    return
+  got = identity(device)
+  if got and got != want:
+    raise WrongDeviceError(
+      f"{device.serial} was emulator {want} and now reaches {got}. The port is "
+      "forwarding to a different instance, so this client has stopped rather "
+      "than play someone else's account.")
+
+def is_connection_error(e: BaseException) -> bool:
+  """Whether an exception means the device stopped answering, not a bug.
+
+  Covers adbutils' own errors (offline, not found, closed, timeouts), socket
+  failures underneath them, and a screencap that came back as something other
+  than an image - which is what a transport dying mid-frame produces.
+  """
+  from adbutils.errors import AdbError
+  from PIL import UnidentifiedImageError
+  return isinstance(e, (AdbError, OSError, UnidentifiedImageError, EOFError))
+
+def recover(device):
+  """Reconnect a dropped device, confirm it is the same emulator, re-pin. True if usable."""
+  if not reconnect(device):
+    return False
+  verify(device)
+  pin(device)
+  return True
+
 def reconnect(device):
   """Re-establish a dropped connection to a networked device. True if it took.
 
@@ -163,9 +235,9 @@ def screenshot(device):
     # second failure escapes uncaught. Reconnect and re-pin once more - the
     # display ids are worth looking up again, since a device that went away
     # and came back may not lay them out the way it did before.
-    if not reconnect(device):
+    if not recover(device):
       raise
-  return pin(device)[0].screenshot(device)
+  return get(device).screenshot(device)
 
 def tap(device, x, y):
   return get(device).input(device, "tap", int(x), int(y))
